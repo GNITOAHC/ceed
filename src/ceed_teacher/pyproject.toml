@@ -1,0 +1,19 @@
+[project]
+name = "ceed-teacher"
+version = "0.1.0"
+description = "Hooked teacher forward passes, artifact extraction, and the CEA ablation engine."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "ceed-core",
+    "accelerate>=1.2",
+    "safetensors>=0.5",
+    "torch",
+    "transformers>=5.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ceed_teacher"]

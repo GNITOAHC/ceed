@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# CEED run outputs. The artifact store and run records are reproducible from a
+# corpus manifest and a configuration hash, so they are not version controlled.
+runs/
+store/
+wandb/
+outputs/

@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync the workspace
+        # CI has no GPU, so the Volta torch build is unnecessary weight. The
+        # scale-out group resolves a CPU-compatible wheel from the same lock.
+        run: uv sync --no-default-groups --group dev --group modern
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Fast test tier
+        run: uv run pytest -q

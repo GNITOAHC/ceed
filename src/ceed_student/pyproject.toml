@@ -1,0 +1,19 @@
+[project]
+name = "ceed-student"
+version = "0.1.0"
+description = "Student wrapper, removable probes, auxiliary signals, and the training loop."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "ceed-core",
+    "accelerate>=1.2",
+    "peft>=0.14",
+    "torch",
+    "transformers>=5.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ceed_student"]

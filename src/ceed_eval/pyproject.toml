@@ -1,0 +1,16 @@
+[project]
+name = "ceed-eval"
+version = "0.1.0"
+description = "Accuracy and hallucination evaluation, plus the grounding-selectivity protocol."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "ceed-core",
+    "lmms-eval>=0.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ceed_eval"]

@@ -1,0 +1,145 @@
+[project]
+name = "ceed"
+version = "0.1.0"
+description = "Causal Expert-Evidence Distillation: distilling measured expert attribution from a sparse MoE vision-language teacher into a compute-matched dense student."
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "ceed-core",
+    "ceed-data",
+    "ceed-eval",
+    "ceed-interventions",
+    "ceed-modes",
+    "ceed-student",
+    "ceed-teacher",
+]
+
+[dependency-groups]
+dev = [
+    "beartype>=0.22",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+# The two hardware targets. CUDA 13 dropped Volta (sm70), so the development box
+# is pinned to a cu126 build while scale-out hardware takes a cu128 build.
+# See docs/adr/0006-torch-pinned-to-cu126-for-volta.md
+#
+# These are dependency groups rather than optional-dependencies because uv has
+# no default-extras setting: with extras, a bare `uv sync` would resolve torch
+# from PyPI (which ships no sm70 kernels) via accelerate/transformers, silently
+# producing an environment that cannot run on this box. default-groups makes the
+# Volta target the default and the failure mode explicit.
+v100 = ["torch==2.9.1"]
+modern = ["torch>=2.9.1"]
+
+[tool.uv]
+package = false
+default-groups = ["dev", "v100"]
+conflicts = [[{ group = "v100" }, { group = "modern" }]]
+
+[tool.uv.workspace]
+members = ["src/*"]
+
+[tool.uv.sources]
+ceed-core = { workspace = true }
+ceed-data = { workspace = true }
+ceed-eval = { workspace = true }
+ceed-interventions = { workspace = true }
+ceed-modes = { workspace = true }
+ceed-student = { workspace = true }
+ceed-teacher = { workspace = true }
+torch = [
+    { index = "pytorch-cu126", group = "v100" },
+    { index = "pytorch-cu128", group = "modern" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# ---------------------------------------------------------------------------
+# Linting and formatting
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "A",   # builtin shadowing
+    "ARG", # unused arguments
+    "B",   # bugbear
+    "C4",  # comprehensions
+    "D",   # pydocstyle
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # import sorting
+    "N",   # naming
+    "PTH", # pathlib
+    "PT",  # pytest style
+    "RET", # return simplification
+    "RUF",
+    "SIM", # simplification
+    "UP",  # pyupgrade
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    # jaxtyping annotations are strings that are not valid Python expressions
+    # (e.g. Float[ndarray, "tokens layers experts"]); F722 flags them as errors.
+    "F722",
+]
+
+[tool.ruff.lint.pydocstyle]
+# Google-style docstrings. The D1xx rules fire only on public names, so this
+# enforces documentation on public APIs while leaving private helpers alone.
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ARG"]
+
+# ---------------------------------------------------------------------------
+# Type checking
+# ---------------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src", "tests"]
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+
+# ceed_core is the shared vocabulary every other package imports, so it is held
+# to a strict standard. The remaining packages are lenient by default.
+# See docs/adr/0004-seven-package-uv-workspace.md
+[[tool.mypy.overrides]]
+module = ["ceed_core.*"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+no_implicit_optional = true
+no_implicit_reexport = true
+warn_return_any = true
+warn_unused_ignores = true
+strict_equality = true
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not gpu and not slow' --strict-markers"
+markers = [
+    "gpu: needs a CUDA device and real model weights (excluded from the fast tier)",
+    "slow: long-running end-to-end check (excluded from the fast tier)",
+]
