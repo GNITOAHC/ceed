@@ -5,6 +5,7 @@ description = "Accuracy and hallucination evaluation, plus the grounding-selecti
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "ceed-core",
+    "ceed-student",
     "lmms-eval>=0.3",
 ]
 

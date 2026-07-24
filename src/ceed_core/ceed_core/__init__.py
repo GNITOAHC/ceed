@@ -9,6 +9,8 @@ it (see docs/adr/0004-seven-package-uv-workspace.md).
 from ceed_core.config import (
     AuxiliarySignalConfig,
     CorpusConfig,
+    DecodingConfig,
+    EvaluationConfig,
     ExtractionConfig,
     GroupConfig,
     LayerMapping,
@@ -28,6 +30,8 @@ __version__ = "0.1.0"
 __all__ = [
     "AuxiliarySignalConfig",
     "CorpusConfig",
+    "DecodingConfig",
+    "EvaluationConfig",
     "ExtractionConfig",
     "GroupConfig",
     "LayerMapping",

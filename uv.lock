@@ -316,12 +316,14 @@ version = "0.1.0"
 source = { editable = "src/ceed_eval" }
 dependencies = [
     { name = "ceed-core" },
+    { name = "ceed-student" },
     { name = "lmms-eval" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "ceed-core", editable = "src/ceed_core" },
+    { name = "ceed-student", editable = "src/ceed_student" },
     { name = "lmms-eval", specifier = ">=0.3" },
 ]
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from ceed_core.config import LayerMapping, ParamEfficiencyMode
+from ceed_core.config import DecodingConfig, LayerMapping, ParamEfficiencyMode
 
 RUN_RECORD_FILENAME = "run_record.json"
 
@@ -35,6 +35,12 @@ class RunRecord(BaseModel):
             the artifact store the run read from.
         metrics_path: Where the run's JSONL metrics were written, as the source
             of truth.
+        metrics: The headline metrics the run produced, such as per-dataset
+            accuracy; empty for a run that produced none.
+        harness_version: The evaluation harness version the metrics came from,
+            or ``None`` if the run did not evaluate.
+        decoding: The decoding settings actually used, or ``None`` if the run
+            did not decode.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -46,6 +52,9 @@ class RunRecord(BaseModel):
     config_hash: str
     extraction_fingerprint: str
     metrics_path: str
+    metrics: dict[str, float] = {}
+    harness_version: str | None = None
+    decoding: DecodingConfig | None = None
 
     def write(self, directory: Path) -> Path:
         """Write the record as pretty-printed JSON into ``directory``.

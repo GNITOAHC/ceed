@@ -1,0 +1,11 @@
+# B0: the zero-shot Student. No training and no auxiliary signal — the Student
+# is evaluated as it ships. This is the first real number and the first place
+# fp16-on-Volta stability is exercised (do the DocVQA path first).
+group_code: B0
+param_efficiency: full
+auxiliary_signals: []
+evaluation:
+  datasets: [docvqa, gqa, chartqa]
+  decoding:
+    do_sample: false # greedy, enforced in code regardless (A9)
+    max_new_tokens: 64

@@ -33,3 +33,15 @@ def null_group_overlays(configs_dir: Path) -> list[Path]:
 def null_config(null_group_overlays: list[Path]) -> GroupConfig:
     """The resolved null Group configuration."""
     return resolve_group_config(null_group_overlays)
+
+
+@pytest.fixture
+def b0_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B0 (zero-shot Student) configuration."""
+    return resolve_group_config(
+        [
+            configs_dir / "base.yaml",
+            configs_dir / "student.yaml",
+            configs_dir / "groups" / "b0.yaml",
+        ]
+    )

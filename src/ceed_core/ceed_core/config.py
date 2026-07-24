@@ -161,6 +161,40 @@ class AuxiliarySignalConfig(_Frozen):
     weight: float = 1.0
 
 
+class DecodingConfig(_Frozen):
+    """How the Student decodes during evaluation.
+
+    Greedy decoding is enforced everywhere, overriding whatever sampling settings
+    a checkpoint's generation config ships, so that decoding variance does not
+    swamp the small effect sizes the plan predicts (plan amendment A9). The
+    sampling fields are recorded so the run record states the decoding actually
+    used, but they are inert while ``do_sample`` is false.
+
+    Attributes:
+        do_sample: Whether sampling is used. False everywhere in CEED.
+        temperature: Sampling temperature, inert under greedy decoding.
+        top_p: Nucleus-sampling threshold, inert under greedy decoding.
+        max_new_tokens: The generation length cap.
+    """
+
+    do_sample: bool = False
+    temperature: float = 1.0
+    top_p: float = 1.0
+    max_new_tokens: int = 64
+
+
+class EvaluationConfig(_Frozen):
+    """What a Group is evaluated on, and how it decodes.
+
+    Attributes:
+        datasets: The datasets accuracy is reported on.
+        decoding: The decoding settings, enforced greedy by default.
+    """
+
+    datasets: tuple[str, ...]
+    decoding: DecodingConfig = DecodingConfig()
+
+
 class Phase2Variant(_Frozen):
     """An optional Phase 2 variant overlay.
 
@@ -193,6 +227,8 @@ class GroupConfig(_Frozen):
         extraction: The extraction-relevant settings (the fingerprint subset).
         corpus: The corpus, or ``None`` for the null Group.
         auxiliary_signals: The signals added on top of the backbone.
+        evaluation: What the Group is evaluated on, or ``None`` if it is not
+            evaluated (as for the null Group).
         phase2: An optional Phase 2 variant.
     """
 
@@ -204,6 +240,7 @@ class GroupConfig(_Frozen):
     extraction: ExtractionConfig
     corpus: CorpusConfig | None = None
     auxiliary_signals: tuple[AuxiliarySignalConfig, ...] = ()
+    evaluation: EvaluationConfig | None = None
     phase2: Phase2Variant | None = None
 
     @field_validator("group_code")
