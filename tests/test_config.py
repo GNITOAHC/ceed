@@ -46,7 +46,7 @@ def test_overlays_compose_into_a_valid_null_group(null_config):
     assert null_config.group_code == "NULL"
     assert null_config.corpus is None
     assert null_config.auxiliary_signals == ()
-    assert null_config.student.model == "gemma-4-E4B-it"
+    assert null_config.student.model == "google/gemma-4-e4b-it"
 
 
 # Two YAML files with the same content but different key order, indentation

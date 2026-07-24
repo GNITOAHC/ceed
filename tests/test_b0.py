@@ -18,7 +18,7 @@ from ceed_core import DecodingConfig, RunRecord
 from ceed_eval import DATASET_TASKS, harness_version
 from ceed_student import EvaluationOutcome, enforce_greedy, load_student, run_group
 
-STUDENT_MODEL = "google/gemma-4-E4B-it"
+STUDENT_MODEL = "google/gemma-4-e4b-it"
 
 
 # -- greedy decoding enforced in code (A9) ----------------------------------
@@ -141,28 +141,62 @@ def _student_is_cached() -> bool:
     return True
 
 
+def _answer(model, processor, content: list[dict]) -> tuple[str, bool]:
+    """Generate an answer for one chat turn, returning it and whether logits stayed finite."""
+    import torch
+
+    inputs = processor.apply_chat_template(
+        [{"role": "user", "content": content}],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+    with torch.no_grad():
+        finite = bool(torch.isfinite(model(**inputs).logits).all())
+    generated = model.generate(**inputs, max_new_tokens=16)
+    answer = processor.decode(
+        generated[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+    ).strip()
+    return answer, finite
+
+
 @pytest.mark.gpu
 def test_student_loads_in_fp16_and_answers_coherently():
-    """The Student casts to fp16 on the V100 and produces a coherent answer.
+    """The Student casts to fp16 on the V100 and stays numerically stable.
 
-    This is B0's first acceptance criterion and the project's first fp16-on-Volta
-    stability check. It is skipped when the Student weights are not cached, so
-    the test never triggers a multi-gigabyte download implicitly.
+    B0's first acceptance criterion and the project's fp16-on-Volta stability
+    gate: the Student must load in fp16 and answer coherently on both the text
+    and the vision path (an fp16 overflow surfaces as non-finite logits before it
+    surfaces as an incoherent string). Skipped when the weights are not cached,
+    so the test never triggers a multi-gigabyte download implicitly.
     """
     import torch
+    from PIL import Image, ImageDraw
 
     if not torch.cuda.is_available():
         pytest.skip("no CUDA device")
     if not _student_is_cached():
         pytest.skip(f"{STUDENT_MODEL} weights are not in the local cache")
 
-    model, processor = load_student(STUDENT_MODEL, DecodingConfig(max_new_tokens=8))
-    messages = [{"role": "user", "content": [{"type": "text", "text": "What is 2 + 2?"}]}]
-    inputs = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True, return_tensors="pt"
-    ).to(model.device)
-    output = model.generate(inputs, max_new_tokens=8)
-    text = processor.decode(output[0], skip_special_tokens=True)
+    model, processor = load_student(STUDENT_MODEL, DecodingConfig(max_new_tokens=16))
+    assert next(model.parameters()).dtype is torch.float16
 
-    assert text.strip()  # a coherent, non-empty answer, and no fp16 NaN crash
-    assert torch.isfinite(model.get_output_embeddings().weight).all()
+    text_answer, text_finite = _answer(
+        model, processor, [{"type": "text", "text": "What is 2 + 2? Answer briefly."}]
+    )
+    assert text_finite  # no fp16 overflow to NaN/Inf on the text path
+    assert text_answer  # a coherent, non-empty answer
+
+    document = Image.new("RGB", (224, 96), "white")
+    ImageDraw.Draw(document).text((20, 30), "Total: 42", fill="black")
+    vision_answer, vision_finite = _answer(
+        model,
+        processor,
+        [
+            {"type": "image", "image": document},
+            {"type": "text", "text": "What number is written in the image? Answer briefly."},
+        ],
+    )
+    assert vision_finite  # the vision tower stays finite in fp16 too
+    assert vision_answer

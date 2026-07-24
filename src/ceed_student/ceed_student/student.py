@@ -64,8 +64,8 @@ def load_student(
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    torch_dtype = getattr(torch, dtype)
-    model = AutoModelForImageTextToText.from_pretrained(model_id, torch_dtype=torch_dtype)
+    compute_dtype = getattr(torch, dtype)
+    model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=compute_dtype)
     model = model.to(device)  # type: ignore[arg-type]
     enforce_greedy(model.generation_config, decoding)
     processor = AutoProcessor.from_pretrained(model_id)

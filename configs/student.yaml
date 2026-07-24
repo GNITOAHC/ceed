@@ -1,5 +1,5 @@
 # Student overlay: the Student checkpoint and the precision it loads in.
 # Volta has no bf16, so the development default is float16.
 student:
-  model: gemma-4-E4B-it
+  model: google/gemma-4-e4b-it
   dtype: float16
