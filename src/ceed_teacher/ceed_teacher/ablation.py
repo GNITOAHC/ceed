@@ -1,7 +1,7 @@
 """The Causal Expert Attribution engine.
 
 For one answer token and one hybrid layer, this measures how much each probed
-expert's specific output matters to the token's gold log-probability, by
+expert's specific output matters to the answer token's gold log-probability, by
 replacing that expert's output with the mean of the token's activated experts and
 reading the change (see docs/adr/0003).
 
@@ -40,7 +40,7 @@ class AttributionResult:
         experts: The probed expert ids, activated experts first, then near-miss
             experts in descending effective-combine-weight order.
         attribution: The attribution of each probed expert, aligned with
-            ``experts``: the drop in the gold token's log-probability when that
+            ``experts``: the drop in the gold answer token's log-probability when that
             expert's output is replaced by the mean of the activated experts'
             outputs.
         n_activated: How many leading entries of ``experts`` are activated

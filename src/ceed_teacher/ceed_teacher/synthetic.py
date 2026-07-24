@@ -15,10 +15,29 @@ property of this model rather than an asserted one.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 from jaxtyping import Float, Int
 from torch import Tensor
+
+
+class HybridFFN(NamedTuple):
+    """The internals of one hybrid layer's feed-forward pass, over a sequence.
+
+    Attributes:
+        shared: The shared dense path's output, ``[..., hidden]``.
+        expert_outputs: Every expert's output, ``[..., experts, hidden]``.
+        effective_weights: Effective combine weights, ``[..., experts]``.
+        activated: Activated expert indices, ``[..., top_k]``.
+        ffn: The combined feed-forward output, ``[..., hidden]``.
+    """
+
+    shared: Tensor
+    expert_outputs: Tensor
+    effective_weights: Tensor
+    activated: Tensor
+    ffn: Tensor
 
 
 @dataclass(frozen=True)
@@ -122,11 +141,17 @@ class SyntheticHybridTeacher:
         attn = torch.softmax(scores, dim=-1) @ v
         return attn @ self._wo[layer].T
 
-    def _hybrid_ffn(self, layer: int, n: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Compute the hybrid FFN for a ``[seq, hidden]`` normalised input.
+    def _hybrid_ffn(self, layer: int, n: Tensor) -> HybridFFN:
+        """Compute the hybrid FFN for a normalised input.
 
-        Returns the shared output, all experts' outputs, the effective combine
-        weights, the activated expert indices, and the combined FFN output.
+        Args:
+            layer: The hybrid layer index.
+            n: The layer-normalised residual state, ``[..., hidden]``; a leading
+                batch dimension is allowed so variants can be run together.
+
+        Returns:
+            The shared output, all experts' outputs, the effective combine
+            weights, the activated expert indices, and the combined FFN output.
         """
         shared = torch.tanh(n @ self._shared_up[layer].T) @ self._shared_down[layer].T
         expert_outs = torch.stack(
@@ -142,7 +167,7 @@ class SyntheticHybridTeacher:
         gate = torch.zeros_like(eff_w).scatter(-1, activated, eff_w.gather(-1, activated))
         routed = (gate.unsqueeze(-1) * expert_outs).sum(dim=-2)  # [..., hidden]
         ffn = shared + routed
-        return shared, expert_outs, eff_w, activated, ffn
+        return HybridFFN(shared, expert_outs, eff_w, activated, ffn)
 
     def run(self, input_ids: Int[Tensor, " seq"]) -> None:
         """Run the teacher-forced forward and cache every hybrid-layer internal.
@@ -165,13 +190,13 @@ class SyntheticHybridTeacher:
             self._layer_input.append(x)
             h = x + self._attention(layer, x)
             self._post_attn.append(h)
-            shared, expert_outs, eff_w, activated, ffn = self._hybrid_ffn(layer, h)
-            self._shared.append(shared)
-            self._expert_out.append(expert_outs)
-            self._eff_weights.append(eff_w)
-            self._activated.append(activated)
-            self._ffn.append(ffn)
-            x = h + ffn
+            block = self._hybrid_ffn(layer, h)
+            self._shared.append(block.shared)
+            self._expert_out.append(block.expert_outputs)
+            self._eff_weights.append(block.effective_weights)
+            self._activated.append(block.activated)
+            self._ffn.append(block.ffn)
+            x = h + block.ffn
 
     # -- HybridForward queries ------------------------------------------------
 
@@ -195,6 +220,14 @@ class SyntheticHybridTeacher:
         """Return the combined feed-forward output for this token."""
         return self._ffn[layer][token]
 
+    def post_attention_output(self, layer: int, token: int) -> Float[Tensor, " hidden"]:
+        """Return the residual state after attention and before the FFN is added.
+
+        The layer's residual stream is this plus the feed-forward output, so it
+        is what an ablation's effect on the residual norm is measured against.
+        """
+        return self._post_attn[layer][token]
+
     def gold_token_id(self, token: int) -> int:
         """Return the next token id, which this position predicts under teacher forcing."""
         assert self._input_ids is not None, "run() must be called before querying"
@@ -204,8 +237,7 @@ class SyntheticHybridTeacher:
         """Run layers ``start..`` on ``x`` of shape ``[..., seq, hidden]`` to logits."""
         for layer in range(start, self.n_layers):
             h = x + self._attention(layer, x)
-            _, _, _, _, ffn = self._hybrid_ffn(layer, h)
-            x = h + ffn
+            x = h + self._hybrid_ffn(layer, h).ffn
         return x @ self._head.T
 
     def resume_full(
@@ -219,6 +251,15 @@ class SyntheticHybridTeacher:
         batch. All positions are returned so that the causal-isolation invariant
         — earlier tokens unchanged — is observable without reaching into
         internals.
+
+        Args:
+            layer: The hybrid layer to resume from.
+            token: The answer-token position whose feed-forward output is
+                overridden.
+            ffn_outputs: One replacement feed-forward output per variant.
+
+        Returns:
+            The logits at every position for each variant.
         """
         assert self._input_ids is not None, "run() must be called before resuming"
         variants = ffn_outputs.shape[0]

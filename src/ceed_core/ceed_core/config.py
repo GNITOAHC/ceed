@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ParamEfficiencyMode(StrEnum):
@@ -181,6 +181,14 @@ class DecodingConfig(_Frozen):
     temperature: float = 1.0
     top_p: float = 1.0
     max_new_tokens: int = 64
+
+    @model_validator(mode="after")
+    def _greedy_only(self) -> DecodingConfig:
+        if self.do_sample:
+            raise ValueError(
+                "greedy decoding is enforced everywhere in CEED (A9); do_sample must be False"
+            )
+        return self
 
 
 class EvaluationConfig(_Frozen):

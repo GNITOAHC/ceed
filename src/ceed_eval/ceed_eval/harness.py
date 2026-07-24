@@ -16,7 +16,7 @@ from __future__ import annotations
 from importlib.metadata import version
 
 from ceed_core import GroupConfig
-from ceed_student import EvaluationOutcome, enforce_greedy, load_student
+from ceed_student import EvaluationOutcome
 
 # Maps CEED dataset names to the lmms-eval task that scores them.
 DATASET_TASKS = {
@@ -24,6 +24,11 @@ DATASET_TASKS = {
     "gqa": "gqa",
     "chartqa": "chartqa",
 }
+
+# The lmms-eval registered model wrapper the Student is driven through. The
+# generic Hugging Face multimodal wrapper is the default; the exact wrapper for
+# gemma-4 is confirmed at the first gpu run and can be overridden per evaluator.
+DEFAULT_MODEL_TYPE = "async_hf_model"
 
 
 def harness_version() -> str:
@@ -34,18 +39,27 @@ def harness_version() -> str:
 class LmmsEvalEvaluator:
     """Evaluates a Group by driving the Student through ``lmms-eval``."""
 
-    def __init__(self, device: str = "cuda", limit: int | None = None) -> None:
+    def __init__(
+        self, model_type: str = DEFAULT_MODEL_TYPE, device: str = "cuda", limit: int | None = None
+    ) -> None:
         """Configure the evaluator.
 
         Args:
+            model_type: The lmms-eval registered model wrapper to load the
+                Student through.
             device: The device to load the Student on.
             limit: An optional cap on examples per dataset, for smoke runs.
         """
+        self.model_type = model_type
         self.device = device
         self.limit = limit
 
     def evaluate(self, config: GroupConfig) -> EvaluationOutcome:  # pragma: no cover - needs GPU
         """Evaluate ``config``'s Student on its datasets and report accuracies.
+
+        The Student is loaded by ``lmms-eval`` from its checkpoint in the Group's
+        dtype, with greedy decoding requested through the model arguments — the
+        harness's own mechanism for the enforcement A9 also applies in code.
 
         Args:
             config: A resolved Group configuration whose ``evaluation`` names the
@@ -64,13 +78,20 @@ class LmmsEvalEvaluator:
         from lmms_eval.evaluator import simple_evaluate
 
         decoding = config.evaluation.decoding
-        model, _ = load_student(
-            config.student.model, decoding, dtype=config.student.dtype, device=self.device
+        model_args = (
+            f"pretrained={config.student.model},"
+            f"dtype={config.student.dtype},"
+            f"do_sample=False,"  # greedy is enforced everywhere (A9)
+            f"max_new_tokens={decoding.max_new_tokens}"
         )
-        enforce_greedy(model.generation_config, decoding)
-
         tasks = [DATASET_TASKS[name] for name in config.evaluation.datasets]
-        results = simple_evaluate(model=model, tasks=tasks, limit=self.limit)
+        results = simple_evaluate(
+            model=self.model_type,
+            model_args=model_args,
+            tasks=tasks,
+            limit=self.limit,
+            device=self.device,
+        )
 
         accuracies = {
             name: _accuracy(results["results"][DATASET_TASKS[name]])

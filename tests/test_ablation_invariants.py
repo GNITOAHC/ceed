@@ -53,14 +53,14 @@ def test_ablating_a_token_leaves_earlier_tokens_bit_identical():
     layer, token = 0, 3
     baseline_ffn = teacher.ffn_output(layer, token)
 
-    # Two variants resumed together: the unchanged FFN, and a perturbed one.
+    # Two variants resumed together: the unchanged FFN, and a nudged one.
     variants = torch.stack([baseline_ffn, baseline_ffn + 1.0])
     full = teacher.resume_full(layer, token, variants)  # [2, seq, vocab]
-    reference, perturbed = full[0], full[1]
+    reference, nudged = full[0], full[1]
 
-    # Perturbing this token cannot change any earlier token's logits.
-    assert torch.equal(perturbed[:token], reference[:token])
-    assert not torch.equal(perturbed[token], reference[token])
+    # Nudging this token cannot change any earlier token's logits.
+    assert torch.equal(nudged[:token], reference[:token])
+    assert not torch.equal(nudged[token], reference[token])
     # Resuming with the unchanged FFN reproduces the baseline at this token.
     baseline_logits = teacher.resume(layer, token, baseline_ffn.unsqueeze(0))
     assert torch.equal(baseline_logits[0], reference[token])
@@ -76,21 +76,26 @@ def test_mean_of_active_replacement_preserves_residual_norm_within_tolerance():
             outputs = teacher.expert_outputs(layer, token)
             activated = teacher.activated_experts(layer, token)
             active_mean = outputs[activated].mean(dim=0)
-            baseline = teacher.ffn_output(layer, token)
-            norm = baseline.norm()
+            ffn = teacher.ffn_output(layer, token)
+            # The residual stream is the post-attention state plus the FFN output;
+            # ADR-0003 is a claim about this norm, not the FFN output's alone.
+            residual = teacher.post_attention_output(layer, token) + ffn
+            norm = residual.norm()
             for expert in activated.tolist():
                 weight, output = weights[expert], outputs[expert]
-                mean_ablated = replace_expert_output(baseline, weight, output, active_mean)
-                zeroed = replace_expert_output(
-                    baseline, weight, output, torch.zeros_like(active_mean)
+                mean_residual = teacher.post_attention_output(layer, token) + replace_expert_output(
+                    ffn, weight, output, active_mean
                 )
-                mean_changes.append(float((mean_ablated.norm() - norm) / norm))
-                zero_changes.append(float((zeroed.norm() - norm) / norm))
+                zero_residual = teacher.post_attention_output(layer, token) + replace_expert_output(
+                    ffn, weight, output, torch.zeros_like(active_mean)
+                )
+                mean_changes.append(float((mean_residual.norm() - norm) / norm))
+                zero_changes.append(float((zero_residual.norm() - norm) / norm))
 
     mean_changes_t = torch.tensor(mean_changes)
     zero_changes_t = torch.tensor(zero_changes)
-    # Per case, mean replacement keeps the FFN-output norm within a tight band.
-    assert mean_changes_t.abs().max() < 0.1
+    # Per case, mean replacement keeps the residual-stream norm within a tight band.
+    assert mean_changes_t.abs().max() < 0.05
     # Systematically, zeroing shrinks the residual norm while mean does not
     # (ADR-0003): the average signed change is markedly more negative for zeroing.
     assert zero_changes_t.mean() < mean_changes_t.mean()

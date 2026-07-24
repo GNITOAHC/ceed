@@ -22,19 +22,22 @@ def enforce_greedy(generation_config: Any, decoding: DecodingConfig) -> Any:
     """Overwrite a generation config so decoding is greedy, whatever it shipped.
 
     The checkpoint's own generation config may enable sampling (Gemma ships
-    ``do_sample: true`` with a temperature and a top-p); this clears every
-    sampling knob and pins a single greedy beam, then applies the run's
-    generation-length cap. It mutates and returns the object it is given.
+    ``do_sample: true`` with a temperature and a top-p); this forces greedy
+    decoding unconditionally — a single beam with sampling off and every
+    sampling knob nulled — regardless of what the checkpoint or the config asks
+    for, then applies the run's generation-length cap. It mutates and returns the
+    object it is given.
 
     Args:
         generation_config: A Hugging Face ``GenerationConfig`` (or anything with
             the same attributes).
-        decoding: The decoding settings to enforce.
+        decoding: The decoding settings; only ``max_new_tokens`` is read, since
+            greedy is not negotiable (:class:`DecodingConfig` forbids sampling).
 
     Returns:
         The same generation config, now greedy.
     """
-    generation_config.do_sample = decoding.do_sample
+    generation_config.do_sample = False
     generation_config.num_beams = 1
     generation_config.max_new_tokens = decoding.max_new_tokens
     # Null out sampling knobs so a stale value can never re-enable sampling.

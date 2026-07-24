@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from transformers import GenerationConfig
 
 from ceed_core import DecodingConfig, RunRecord
@@ -37,6 +38,19 @@ def test_enforce_greedy_overrides_a_sampling_config():
 
 
 # -- harness version is a real, recordable value ----------------------------
+
+
+def test_a_sampling_decoding_config_is_rejected():
+    # Greedy is not a per-Group knob: sampling cannot be configured at all (A9).
+    with pytest.raises(ValidationError, match="greedy decoding is enforced"):
+        DecodingConfig(do_sample=True)
+
+
+def test_enforce_greedy_forces_greedy_even_from_a_greedy_looking_config():
+    # enforce_greedy does not trust the config's flag; it forces greedy in code.
+    shipped = GenerationConfig(do_sample=True, temperature=0.7)
+    enforce_greedy(shipped, DecodingConfig(max_new_tokens=16))
+    assert shipped.do_sample is False
 
 
 def test_harness_version_is_the_installed_lmms_eval_version():
