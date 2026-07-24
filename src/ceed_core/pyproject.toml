@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.1",
     "pyarrow>=18.0",
     "pydantic>=2.10",
+    "pyyaml>=6.0",
 ]
 
 [build-system]

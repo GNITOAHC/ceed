@@ -1,0 +1,7 @@
+# The null Group: no auxiliary signals, no model, no corpus. It exists so the
+# run_group spine can be exercised end to end without any real work — the
+# degenerate arm every later Group is a superset of.
+# Quoted so YAML does not read the bare word NULL as a null value.
+group_code: "NULL"
+corpus: null
+auxiliary_signals: []

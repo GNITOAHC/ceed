@@ -1,0 +1,21 @@
+# Base overlay: settings shared by every Group before the student, Group, and
+# optional Phase 2 overlays are applied on top. See ceed_core.config.
+seed: 0
+param_efficiency: lora
+
+layer_mapping:
+  kind: proportional
+  # (teacher_layer, student_layer) pairs. Proportional placeholder that unblocks
+  # B3 until the probe-based mapping study concludes.
+  pairs:
+    - [9, 12]
+    - [19, 26]
+    - [29, 39]
+
+extraction:
+  teacher_model: gemma-4-26B-A4B-it
+  model_revision: main
+  layers: [9, 19, 29]
+  ablation: mean-of-active
+  combine_weight: effective
+  thinking_enabled: false
