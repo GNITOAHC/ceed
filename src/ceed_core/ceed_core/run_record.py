@@ -36,7 +36,12 @@ class RunRecord(BaseModel):
         metrics_path: Where the run's JSONL metrics were written, as the source
             of truth.
         metrics: The headline metrics the run produced, such as per-dataset
-            accuracy; empty for a run that produced none.
+            accuracy and, for a trained Group, the final backbone loss terms;
+            empty for a run that produced none.
+        checkpoint_dir: Where the trained Student checkpoint was frozen, or
+            ``None`` for a Group that trained nothing (B0). A baseline's
+            checkpoint is reused rather than retrained, so this is the durable
+            handle to it.
         harness_version: The evaluation harness version the metrics came from,
             or ``None`` if the run did not evaluate.
         decoding: The decoding settings actually used, or ``None`` if the run
@@ -53,6 +58,7 @@ class RunRecord(BaseModel):
     extraction_fingerprint: str
     metrics_path: str
     metrics: dict[str, float] = {}
+    checkpoint_dir: str | None = None
     harness_version: str | None = None
     decoding: DecodingConfig | None = None
 

@@ -144,6 +144,72 @@ class ExtractionConfig(_Frozen):
     thinking_enabled: bool = False
 
 
+class BackboneConfig(_Frozen):
+    """The shared backbone objective every trained Group carries.
+
+    Cross-entropy on the gold answer plus top-k logit distillation is
+    implemented once and shared by every Group, so no Group can accidentally
+    differ in it. Only its scalar weighting and distillation temperature are
+    configurable; the objective itself is fixed in code.
+
+    Attributes:
+        kd_weight: The weight of the top-k logit-distillation term relative to
+            the cross-entropy term.
+        kd_temperature: The softmax temperature the teacher and Student logits
+            are matched at (Hinton distillation), applied to the cached top-k
+            support.
+    """
+
+    kd_weight: float = 1.0
+    kd_temperature: float = Field(default=1.0, gt=0.0)
+
+
+class WarmupConfig(_Frozen):
+    """When auxiliary supervision is allowed to act, relative to the backbone.
+
+    Auxiliary terms are held out entirely for an initial backbone-only window
+    and then ramped in linearly, so they cannot destabilise early training. B1
+    and B2 carry no auxiliary signals, so the schedule is inert for them but is
+    still recorded as part of the Group's identity.
+
+    Attributes:
+        backbone_only_steps: The number of initial steps during which auxiliary
+            terms contribute nothing (scale zero).
+        ramp_steps: The number of steps over which the auxiliary scale ramps
+            linearly from zero to one once the backbone-only window has passed.
+    """
+
+    backbone_only_steps: int = Field(default=0, ge=0)
+    ramp_steps: int = Field(default=0, ge=0)
+
+
+class TrainingConfig(_Frozen):
+    """How a Group trains the Student, or ``None`` for a zero-shot Group.
+
+    Present on every trained Group (B1 upward) and absent on B0, exactly as an
+    ``evaluation`` is present on an evaluated Group. It is part of the run hash
+    — two Groups that train differently are different runs — but not the
+    extraction fingerprint, since training settings do not change what was
+    extracted from the Teacher.
+
+    Attributes:
+        steps: The number of optimiser steps to run.
+        learning_rate: The optimiser learning rate.
+        batch_size: The number of examples per step.
+        checkpoint_every: How often (in steps) to checkpoint; ``0`` checkpoints
+            only at the end. Resumption reads the most recent checkpoint.
+        backbone: The shared backbone objective's weighting.
+        warmup: The auxiliary-signal warm-up schedule.
+    """
+
+    steps: int = Field(gt=0)
+    learning_rate: float = Field(default=1e-4, gt=0.0)
+    batch_size: int = Field(default=1, gt=0)
+    checkpoint_every: int = Field(default=0, ge=0)
+    backbone: BackboneConfig = BackboneConfig()
+    warmup: WarmupConfig = WarmupConfig()
+
+
 class AuxiliarySignalConfig(_Frozen):
     """One auxiliary supervision signal added on top of the shared backbone.
 
@@ -235,6 +301,8 @@ class GroupConfig(_Frozen):
         extraction: The extraction-relevant settings (the fingerprint subset).
         corpus: The corpus, or ``None`` for the null Group.
         auxiliary_signals: The signals added on top of the backbone.
+        training: How the Student is trained, or ``None`` for a zero-shot Group
+            (B0) that trains nothing.
         evaluation: What the Group is evaluated on, or ``None`` if it is not
             evaluated (as for the null Group).
         phase2: An optional Phase 2 variant.
@@ -248,6 +316,7 @@ class GroupConfig(_Frozen):
     extraction: ExtractionConfig
     corpus: CorpusConfig | None = None
     auxiliary_signals: tuple[AuxiliarySignalConfig, ...] = ()
+    training: TrainingConfig | None = None
     evaluation: EvaluationConfig | None = None
     phase2: Phase2Variant | None = None
 

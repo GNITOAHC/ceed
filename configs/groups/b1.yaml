@@ -1,0 +1,25 @@
+# B1: supervised fine-tuning of the Student, no teacher. It carries the shared
+# backbone like every trained Group, but zeroes the logit-distillation term
+# (kd_weight: 0) so only the cross-entropy on gold answers acts — B1 is the
+# no-teacher control B2 is measured against. No auxiliary signals.
+group_code: B1
+corpus:
+  name: ceed-vqa
+  splits: [train]
+auxiliary_signals: []
+training:
+  steps: 2000
+  learning_rate: 1.0e-4
+  batch_size: 8
+  checkpoint_every: 200
+  backbone:
+    kd_weight: 0.0 # no teacher: cross-entropy only
+    kd_temperature: 1.0
+  warmup:
+    backbone_only_steps: 0
+    ramp_steps: 0
+evaluation:
+  datasets: [docvqa, gqa, chartqa]
+  decoding:
+    do_sample: false # greedy, enforced in code regardless (A9)
+    max_new_tokens: 64

@@ -1,0 +1,341 @@
+"""The Student training loop: the shared backbone, checkpointed and resumable.
+
+The loop is built on ``accelerate`` so a multi-day Group survives preemption: it
+``save_state``s the model, optimiser and RNG on a cadence and, on restart,
+``load_state``s them and continues from the step it reached rather than from
+zero. A baseline that has already reached its step budget is therefore never
+retrained — the frozen checkpoint is reused.
+
+Parameter efficiency is one flag. ``full`` optimises every Student parameter;
+``lora`` wraps the Student with a PEFT adapter and optimises only that. The mode
+is carried into the :class:`TrainingOutcome` so the run record can state it
+unambiguously — a LoRA number must never be mistaken for a full fine-tune
+(ADR-0005).
+
+The objective is the shared backbone alone (:func:`ceed_student.backbone`),
+assembled through :func:`ceed_student.auxiliary.training_loss` with an empty set
+of auxiliary terms and the Group's warm-up schedule. B1 and B2 attach no
+auxiliary signals; the schedule is wired and honoured so that the first Group to
+add a signal changes only what fills that empty list, never this loop.
+
+The heavy dependencies — ``accelerate`` and ``peft`` — and the real Student are
+injected or imported lazily, so importing this module and running the loop
+against a tiny CPU Student stays cheap and needs no GPU.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+import torch
+from torch import Tensor
+
+from ceed_core import GroupConfig, ParamEfficiencyMode
+from ceed_student.auxiliary import AuxTerm, ForwardView, WarmupSchedule, training_loss
+from ceed_student.backbone import backbone_loss
+
+CHECKPOINT_DIRNAME = "checkpoint"
+PROGRESS_FILENAME = "progress.json"
+
+
+@dataclass
+class TrainingBatch:
+    """One step's inputs: the Student's inputs and the teacher's cached targets.
+
+    Attributes:
+        student_inputs: The model-specific tensors the Student is run on (e.g.
+            ``input_ids`` and pixel values), moved to the device by the trainer.
+        answer_token_positions: The output positions that are answer tokens —
+            the positions the backbone is scored at.
+        gold_token_ids: The gold token id at each answer position.
+        teacher_topk_ids: The teacher's top-k logit ids at each answer position.
+        teacher_topk_values: The teacher's top-k logit values at those ids.
+        coupling_strength: The teacher-measured coupling strength per answer
+            token, used to gate auxiliary losses; ``None`` when no signal needs
+            it (B1, B2).
+        artefacts: Any further per-token artefacts an auxiliary signal reads;
+            empty for the backbone-only Groups.
+    """
+
+    student_inputs: dict[str, Tensor]
+    answer_token_positions: Tensor
+    gold_token_ids: Tensor
+    teacher_topk_ids: Tensor
+    teacher_topk_values: Tensor
+    coupling_strength: Tensor | None = None
+    artefacts: dict[str, Tensor] = field(default_factory=dict)
+
+
+@runtime_checkable
+class TrainableStudent(Protocol):
+    """A Student the loop can train: a torch module that answers per forward view.
+
+    The concrete Student is a ``torch.nn.Module`` (so it has parameters the
+    optimiser and ``accelerate`` handle); this protocol adds the one method the
+    loop calls — producing the answer-token logits under a given forward view.
+    """
+
+    def answer_logits(self, batch: TrainingBatch, view: ForwardView) -> Tensor:
+        """Return the Student's answer-token logits for ``batch`` under ``view``."""
+        ...
+
+
+@dataclass(frozen=True)
+class TrainingOutcome:
+    """What a training run reports back.
+
+    Attributes:
+        param_efficiency: The mode the run actually trained under, recorded so a
+            LoRA number can never reach the Phase 1 table as a full fine-tune.
+        lora_rank: The LoRA adapter rank when the run was LoRA, else ``None`` —
+            so a null result is read against the adapter capacity behind it
+            (ADR-0005).
+        steps: The step budget targeted (the config's ``steps``).
+        steps_run: How many steps this invocation actually ran — zero when a
+            completed checkpoint was reused.
+        resumed: Whether the run continued from an existing checkpoint.
+        initial_loss: The backbone loss at this invocation's first step (or the
+            restored final loss if nothing ran).
+        final_loss: The backbone loss at the last step trained.
+        backbone_metrics: The final cross-entropy and distillation components.
+        checkpoint_dir: Where the (frozen, reusable) checkpoint was written.
+        total_parameters: The Student's total parameter count.
+        trainable_parameters: How many parameters the optimiser updated.
+    """
+
+    param_efficiency: ParamEfficiencyMode
+    lora_rank: int | None
+    steps: int
+    steps_run: int
+    resumed: bool
+    initial_loss: float
+    final_loss: float
+    backbone_metrics: dict[str, float]
+    checkpoint_dir: str
+    total_parameters: int
+    trainable_parameters: int
+
+
+@runtime_checkable
+class Trainer(Protocol):
+    """Something that can train a resolved Group and report the outcome.
+
+    Injected into :func:`ceed_student.run.run_group` exactly as the evaluator
+    is, so the spine stays free of ``accelerate``, ``peft`` and the real Student
+    at import time and remains exercisable on CPU.
+    """
+
+    def train(self, config: GroupConfig) -> TrainingOutcome:
+        """Train ``config``'s Student and return the outcome."""
+        ...
+
+
+def _move_batch(batch: TrainingBatch, device: Any) -> TrainingBatch:
+    """Return ``batch`` with every tensor moved to ``device``."""
+    return replace(
+        batch,
+        student_inputs={k: v.to(device) for k, v in batch.student_inputs.items()},
+        answer_token_positions=batch.answer_token_positions.to(device),
+        gold_token_ids=batch.gold_token_ids.to(device),
+        teacher_topk_ids=batch.teacher_topk_ids.to(device),
+        teacher_topk_values=batch.teacher_topk_values.to(device),
+        coupling_strength=None
+        if batch.coupling_strength is None
+        else batch.coupling_strength.to(device),
+        artefacts={k: v.to(device) for k, v in batch.artefacts.items()},
+    )
+
+
+def _apply_param_efficiency(
+    student: torch.nn.Module,
+    mode: ParamEfficiencyMode,
+    lora_targets: Sequence[str],
+    lora_rank: int,
+    lora_alpha: int,
+) -> torch.nn.Module:
+    """Return the module to optimise for ``mode``.
+
+    ``full`` returns the Student unchanged (every parameter trains). ``lora``
+    wraps it in a PEFT LoRA adapter over ``lora_targets`` and returns the wrapper
+    (only the adapter trains).
+    """
+    if mode is ParamEfficiencyMode.FULL:
+        return student
+    from peft import LoraConfig, get_peft_model
+
+    config = LoraConfig(
+        r=lora_rank, lora_alpha=lora_alpha, target_modules=list(lora_targets), lora_dropout=0.0
+    )
+    return get_peft_model(student, config)  # type: ignore[arg-type]
+
+
+class AccelerateTrainer:
+    """Trains a Student on the shared backbone with checkpointing and resume."""
+
+    def __init__(
+        self,
+        build_student: Callable[[GroupConfig], TrainableStudent],
+        build_batches: Callable[[GroupConfig], Sequence[TrainingBatch]],
+        output_root: Path,
+        lora_targets: Sequence[str] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+        lora_rank: int = 4,
+        lora_alpha: int = 8,
+        cpu: bool = False,
+    ) -> None:
+        """Configure the trainer.
+
+        The parameter-efficiency mode is *not* a trainer setting: it is read from
+        ``config.param_efficiency`` at :meth:`train` time, so the single
+        configuration flag selects it and the trainer cannot silently disagree
+        with the Group it is running (ADR-0005).
+
+        Args:
+            build_student: Builds the Student for a Group. Injected so the real
+                8B Student never reaches this module at import time.
+            build_batches: Builds the Group's training batches (Student inputs
+                plus the teacher's cached targets read from the store).
+            output_root: The directory the checkpoint is written under.
+            lora_targets: The module names LoRA adapts when in LoRA mode.
+            lora_rank: The LoRA adapter rank; recorded so a null result can be
+                read against the adapter capacity that produced it (ADR-0005).
+            lora_alpha: The LoRA scaling factor.
+            cpu: Force CPU execution (used by the fast test tier).
+        """
+        self.build_student = build_student
+        self.build_batches = build_batches
+        self.output_root = output_root
+        self.lora_targets = lora_targets
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.cpu = cpu
+
+    def _checkpoint_dir(self) -> Path:
+        return self.output_root / CHECKPOINT_DIRNAME
+
+    def _read_progress(self) -> dict[str, Any] | None:
+        path = self._checkpoint_dir() / PROGRESS_FILENAME
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text())
+
+    def _write_progress(self, completed: int, metrics: dict[str, float], params: dict[str, int]):
+        checkpoint = self._checkpoint_dir()
+        checkpoint.mkdir(parents=True, exist_ok=True)
+        (checkpoint / PROGRESS_FILENAME).write_text(
+            json.dumps({"completed_steps": completed, **metrics, **params})
+        )
+
+    def train(self, config: GroupConfig) -> TrainingOutcome:
+        """Train the Group's Student on the backbone, resuming if a checkpoint exists.
+
+        Args:
+            config: A resolved Group whose ``training`` declares the budget and
+                schedule.
+
+        Returns:
+            The training outcome, including the parameter-efficiency mode used
+            and the frozen checkpoint's location.
+
+        Raises:
+            ValueError: If the Group declares no training.
+        """
+        if config.training is None:
+            raise ValueError(f"Group {config.group_code} declares no training")
+        training = config.training
+        # One configuration flag selects the mode; the trainer reads it here
+        # rather than carrying its own, so the recorded mode is the mode that
+        # actually trained (ADR-0005).
+        mode = config.param_efficiency
+
+        from accelerate import Accelerator
+
+        accelerator = Accelerator(cpu=self.cpu)
+
+        student = self.build_student(config)
+        total_parameters = sum(p.numel() for p in student.parameters())  # type: ignore[attr-defined]
+        model = _apply_param_efficiency(
+            student,  # type: ignore[arg-type]
+            mode,
+            self.lora_targets,
+            self.lora_rank,
+            self.lora_alpha,
+        )
+        trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=training.learning_rate
+        )
+        model, optimizer = accelerator.prepare(model, optimizer)
+
+        batches = self.build_batches(config)
+        schedule = WarmupSchedule(training.warmup.backbone_only_steps, training.warmup.ramp_steps)
+        params = {
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+        }
+
+        prior = self._read_progress()
+        completed = 0
+        resumed = False
+        restored = {"loss": 0.0, "cross_entropy": 0.0, "kd": 0.0}
+        if prior is not None:
+            accelerator.load_state(str(self._checkpoint_dir()))
+            completed = int(prior["completed_steps"])
+            resumed = completed > 0
+            restored = {k: float(prior.get(k, 0.0)) for k in restored}
+
+        initial_loss = restored["loss"]
+        last = dict(restored)
+        no_aux: list[AuxTerm] = []
+
+        model.train()
+        for step in range(completed, training.steps):
+            batch = _move_batch(batches[step % len(batches)], accelerator.device)
+            logits = model.answer_logits(batch, ForwardView.ORIGINAL)
+            backbone = backbone_loss(
+                logits,
+                batch.gold_token_ids,
+                batch.teacher_topk_ids,
+                batch.teacher_topk_values,
+                kd_weight=training.backbone.kd_weight,
+                temperature=training.backbone.kd_temperature,
+            )
+            loss = training_loss(backbone, no_aux, step=step, schedule=schedule)
+
+            optimizer.zero_grad()
+            accelerator.backward(loss)
+            optimizer.step()
+
+            last = {
+                "loss": float(loss.detach()),
+                "cross_entropy": float(backbone.cross_entropy.detach()),
+                "kd": float(backbone.kd.detach()),
+            }
+            if step == completed:
+                initial_loss = last["loss"]
+            if training.checkpoint_every and (step + 1) % training.checkpoint_every == 0:
+                accelerator.save_state(str(self._checkpoint_dir()))
+                self._write_progress(step + 1, last, params)
+
+        steps_run = training.steps - completed
+        if steps_run > 0:
+            accelerator.save_state(str(self._checkpoint_dir()))
+            self._write_progress(training.steps, last, params)
+
+        return TrainingOutcome(
+            param_efficiency=mode,
+            lora_rank=self.lora_rank if mode is ParamEfficiencyMode.LORA else None,
+            steps=training.steps,
+            steps_run=steps_run,
+            resumed=resumed,
+            initial_loss=initial_loss,
+            final_loss=last["loss"],
+            backbone_metrics={"cross_entropy": last["cross_entropy"], "kd": last["kd"]},
+            checkpoint_dir=str(self._checkpoint_dir()),
+            total_parameters=total_parameters,
+            trainable_parameters=trainable_parameters,
+        )

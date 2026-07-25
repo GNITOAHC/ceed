@@ -35,13 +35,29 @@ def null_config(null_group_overlays: list[Path]) -> GroupConfig:
     return resolve_group_config(null_group_overlays)
 
 
-@pytest.fixture
-def b0_config(configs_dir: Path) -> GroupConfig:
-    """The resolved B0 (zero-shot Student) configuration."""
+def _resolve(configs_dir: Path, group: str) -> GroupConfig:
     return resolve_group_config(
         [
             configs_dir / "base.yaml",
             configs_dir / "student.yaml",
-            configs_dir / "groups" / "b0.yaml",
+            configs_dir / "groups" / f"{group}.yaml",
         ]
     )
+
+
+@pytest.fixture
+def b0_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B0 (zero-shot Student) configuration."""
+    return _resolve(configs_dir, "b0")
+
+
+@pytest.fixture
+def b1_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B1 (supervised fine-tuning, no teacher) configuration."""
+    return _resolve(configs_dir, "b1")
+
+
+@pytest.fixture
+def b2_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B2 (primary baseline: CE + logit KD) configuration."""
+    return _resolve(configs_dir, "b2")

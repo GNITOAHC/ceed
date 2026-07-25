@@ -1,0 +1,25 @@
+# B2: the primary baseline. The shared backbone in full — cross-entropy on gold
+# answers plus top-k logit distillation against the teacher (kd_weight: 1) — and
+# no auxiliary signals. Every experimental Group is B2 plus one or more signals,
+# so B2 is the number they are all measured against.
+group_code: B2
+corpus:
+  name: ceed-vqa
+  splits: [train]
+auxiliary_signals: []
+training:
+  steps: 2000
+  learning_rate: 1.0e-4
+  batch_size: 8
+  checkpoint_every: 200
+  backbone:
+    kd_weight: 1.0 # cross-entropy plus top-k logit distillation
+    kd_temperature: 2.0
+  warmup:
+    backbone_only_steps: 0
+    ramp_steps: 0
+evaluation:
+  datasets: [docvqa, gqa, chartqa]
+  decoding:
+    do_sample: false # greedy, enforced in code regardless (A9)
+    max_new_tokens: 64
