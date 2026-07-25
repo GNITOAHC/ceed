@@ -119,6 +119,7 @@ class SyntheticHybridTeacher:
         self._head = _linear(gen, c.vocab_size, h)  # [vocab, hidden]
 
         self._input_ids: Tensor | None = None
+        self._prompt_length = 0
         self._layer_input: list[Tensor] = []  # x entering each layer, [seq, hidden]
         self._post_attn: list[Tensor] = []  # h after attention, pre-FFN, [seq, hidden]
         self._shared: list[Tensor] = []  # [seq, hidden]
@@ -126,6 +127,8 @@ class SyntheticHybridTeacher:
         self._eff_weights: list[Tensor] = []  # [seq, experts]
         self._activated: list[Tensor] = []  # [seq, top_k]
         self._ffn: list[Tensor] = []  # [seq, hidden]
+        self._layer_output: list[Tensor] = []  # x leaving each layer, [seq, hidden]
+        self._final_logits: Tensor | None = None  # [seq, vocab]
 
     # -- forward -------------------------------------------------------------
 
@@ -169,14 +172,18 @@ class SyntheticHybridTeacher:
         ffn = shared + routed
         return HybridFFN(shared, expert_outs, eff_w, activated, ffn)
 
-    def run(self, input_ids: Int[Tensor, " seq"]) -> None:
+    def run(self, input_ids: Int[Tensor, " seq"], prompt_length: int | None = None) -> None:
         """Run the teacher-forced forward and cache every hybrid-layer internal.
 
         Args:
             input_ids: The token ids of one example, prompt and gold answer
                 concatenated.
+            prompt_length: How many leading tokens are the prompt; the rest are
+                the gold answer whose tokens are the answer tokens. Defaults to
+                all but the last token, so the last token is the one answer token.
         """
         self._input_ids = input_ids
+        self._prompt_length = len(input_ids) - 1 if prompt_length is None else prompt_length
         self._layer_input = []
         self._post_attn = []
         self._shared = []
@@ -184,6 +191,7 @@ class SyntheticHybridTeacher:
         self._eff_weights = []
         self._activated = []
         self._ffn = []
+        self._layer_output = []
 
         x = self._embed[input_ids]  # [seq, hidden]
         for layer in range(self.n_layers):
@@ -197,6 +205,8 @@ class SyntheticHybridTeacher:
             self._activated.append(block.activated)
             self._ffn.append(block.ffn)
             x = h + block.ffn
+            self._layer_output.append(x)
+        self._final_logits = x @ self._head.T  # [seq, vocab]
 
     # -- HybridForward queries ------------------------------------------------
 
@@ -232,6 +242,54 @@ class SyntheticHybridTeacher:
         """Return the next token id, which this position predicts under teacher forcing."""
         assert self._input_ids is not None, "run() must be called before querying"
         return int(self._input_ids[token + 1])
+
+    # -- extraction queries ---------------------------------------------------
+
+    def logits(self, token: int) -> Float[Tensor, " vocab"]:
+        """Return the next-token logits at a position (the prediction it makes)."""
+        assert self._final_logits is not None, "run() must be called before querying"
+        return self._final_logits[token]
+
+    def hidden_state(self, layer: int, token: int) -> Float[Tensor, " hidden"]:
+        """Return the residual-stream state leaving ``layer`` at this position.
+
+        This is the per-layer hidden state a hidden-state KD group supervises.
+        """
+        return self._layer_output[layer][token]
+
+    def answer_measurement_positions(self) -> list[int]:
+        """Return the positions whose next token is an answer token.
+
+        Under teacher forcing the prediction of answer token ``t`` is made at
+        position ``t - 1``, so these are the positions an extractor reads
+        artefacts at; each corresponds to answer-token index ``position + 1``.
+        """
+        assert self._input_ids is not None, "run() must be called before querying"
+        return list(range(self._prompt_length - 1, len(self._input_ids) - 1))
+
+    def correctness(self) -> bool:
+        """Return whether free generation from the prompt reproduces the gold answer.
+
+        This is the separate free-generation pass of ADR-0002: greedy generation
+        from the prompt, independent of teacher forcing. It re-runs the forward
+        and so must be called after the teacher-forced artefacts have been read;
+        it restores the teacher-forced state before returning.
+        """
+        assert self._input_ids is not None, "run() must be called before querying"
+        original, prompt_length = self._input_ids, self._prompt_length
+        prompt = original[:prompt_length]
+        gold = original[prompt_length:].tolist()
+
+        generated: list[int] = []
+        sequence = prompt.tolist()
+        for _ in range(len(gold)):
+            self.run(torch.tensor(sequence), prompt_length=len(sequence))
+            assert self._final_logits is not None
+            generated.append(int(self._final_logits[-1].argmax()))
+            sequence.append(generated[-1])
+
+        self.run(original, prompt_length=prompt_length)  # restore teacher-forced state
+        return generated == gold
 
     def _forward_tail(self, x: Tensor, start: int) -> Tensor:
         """Run layers ``start..`` on ``x`` of shape ``[..., seq, hidden]`` to logits."""

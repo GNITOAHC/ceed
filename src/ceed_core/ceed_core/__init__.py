@@ -6,6 +6,16 @@ heavy and mutually hostile dependency trees of the other packages cannot reach
 it (see docs/adr/0004-seven-package-uv-workspace.md).
 """
 
+from ceed_core.artifact_store import (
+    ArtifactRow,
+    ArtifactShardWriter,
+    ArtifactStore,
+    ArtifactStoreError,
+    MissingArtifactKindError,
+    StoreMetadata,
+    VectorSpec,
+    store_root,
+)
 from ceed_core.config import (
     AuxiliarySignalConfig,
     CorpusConfig,
@@ -28,6 +38,10 @@ from ceed_core.run_record import RunRecord
 __version__ = "0.1.0"
 
 __all__ = [
+    "ArtifactRow",
+    "ArtifactShardWriter",
+    "ArtifactStore",
+    "ArtifactStoreError",
     "AuxiliarySignalConfig",
     "CorpusConfig",
     "DecodingConfig",
@@ -36,13 +50,17 @@ __all__ = [
     "GroupConfig",
     "LayerMapping",
     "MetricsSink",
+    "MissingArtifactKindError",
     "ParamEfficiencyMode",
     "Phase2Variant",
     "RunRecord",
+    "StoreMetadata",
     "StudentConfig",
     "Tracker",
+    "VectorSpec",
     "canonical_json",
     "extraction_fingerprint",
     "resolve_group_config",
     "run_hash",
+    "store_root",
 ]
