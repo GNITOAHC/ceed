@@ -284,6 +284,16 @@ class ArtifactStore:
         Returns:
             The result rows as tuples.
         """
+        return self._read(sql)
+
+    def _read(self, sql: str, params: Sequence[Any] | None = None) -> list[tuple[Any, ...]]:
+        """Run one SQL statement against the shards, exposed as the ``artifacts`` view.
+
+        This is the single place a DuckDB connection is opened over the store, so
+        the shard glob, the empty-store view, and the connection lifecycle are
+        defined once. An empty store presents an empty ``artifacts`` view rather
+        than an error, so callers need no special case.
+        """
         glob = self._shard_glob()
         connection = duckdb.connect()
         try:
@@ -295,7 +305,7 @@ class ArtifactStore:
                 connection.execute(
                     f"CREATE TEMP VIEW artifacts AS SELECT * FROM read_parquet('{glob}')"
                 )
-            return connection.execute(sql).fetchall()
+            return connection.execute(sql, params or []).fetchall()
         finally:
             connection.close()
 
@@ -304,17 +314,7 @@ class ArtifactStore:
 
         A resumed extraction skips these rather than restarting.
         """
-        glob = self._shard_glob()
-        if glob is None:
-            return set()
-        connection = duckdb.connect()
-        try:
-            rows = connection.execute(
-                f"SELECT DISTINCT {EXAMPLE_ID} FROM read_parquet('{glob}')"
-            ).fetchall()
-        finally:
-            connection.close()
-        return {row[0] for row in rows}
+        return {row[0] for row in self._read(f"SELECT DISTINCT {EXAMPLE_ID} FROM artifacts")}
 
     def vector(self, example_id: str, answer_token_index: int, kind: str) -> np.ndarray:
         """Return one decoded vector artefact.
@@ -333,18 +333,10 @@ class ArtifactStore:
         """
         if kind not in self.metadata.vector_kinds:
             raise MissingArtifactKindError(f"store does not hold kind {kind!r}")
-        glob = self._shard_glob()
-        if glob is None:
-            raise ArtifactStoreError("store is empty")
-        connection = duckdb.connect()
-        try:
-            result = connection.execute(
-                f"SELECT {kind} FROM read_parquet('{glob}') "
-                f"WHERE {EXAMPLE_ID} = ? AND {ANSWER_TOKEN_INDEX} = ?",
-                [example_id, answer_token_index],
-            ).fetchone()
-        finally:
-            connection.close()
-        if result is None:
+        rows = self._read(
+            f"SELECT {kind} FROM artifacts WHERE {EXAMPLE_ID} = ? AND {ANSWER_TOKEN_INDEX} = ?",
+            [example_id, answer_token_index],
+        )
+        if not rows:
             raise ArtifactStoreError(f"no row for ({example_id!r}, {answer_token_index}) in store")
-        return self.metadata.vector_kinds[kind].decode(result[0])
+        return self.metadata.vector_kinds[kind].decode(rows[0][0])
