@@ -5,6 +5,7 @@ description = "Student wrapper, removable probes, auxiliary signals, and the tra
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "ceed-core",
+    "ceed-data",
     "accelerate>=1.2",
     "peft>=0.14",
     "torch",

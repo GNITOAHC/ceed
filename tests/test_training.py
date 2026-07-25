@@ -11,12 +11,14 @@ mistaken for a full fine-tune).
 
 from typing import Any
 
+import pytest
 import torch
 from ceed_student.training import (
     AccelerateTrainer,
     TrainableStudent,
     TrainingBatch,
     TrainingOutcome,
+    resolve_lora_targets,
 )
 
 from ceed_core import BackboneConfig, ParamEfficiencyMode, TrainingConfig, WarmupConfig
@@ -184,3 +186,38 @@ def test_the_mode_is_taken_from_the_config_flag_not_the_trainer(tmp_path):
 
 def test_the_student_conforms_to_the_trainable_protocol():
     assert isinstance(TinyStudent(), TrainableStudent)
+
+
+# -- LoRA target resolution --------------------------------------------------
+
+
+class _Wrapped(torch.nn.Module):
+    """Stands in for gemma-4's Gemma4ClippableLinear: not a plain Linear."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(4, 4)
+
+
+class _VisionLanguage(torch.nn.Module):
+    """A Student with the same q_proj name on an adaptable and a wrapped module."""
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = torch.nn.Module()
+        self.language_model.q_proj = torch.nn.Linear(4, 4)
+        self.vision_tower = torch.nn.Module()
+        self.vision_tower.q_proj = _Wrapped()
+
+
+def test_lora_targets_resolve_to_adaptable_modules_only():
+    # The vision tower's q_proj is not a plain Linear; targeting it by bare leaf
+    # name is what breaks PEFT on the real Student.
+    targets = resolve_lora_targets(_VisionLanguage(), ["q_proj"])
+    assert targets == ["language_model.q_proj"]
+
+
+def test_resolving_no_adaptable_target_is_refused():
+    # An adapter that matches nothing would train nothing, silently.
+    with pytest.raises(ValueError, match="no adaptable"):
+        resolve_lora_targets(_VisionLanguage(), ["not_a_module"])

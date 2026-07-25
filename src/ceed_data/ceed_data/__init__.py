@@ -1,5 +1,6 @@
 """Corpus assembly: DocVQA, GQA, and ChartQA normalised into one Example type."""
 
+from ceed_data.corpus import CORPUS_FILENAME, read_examples, write_examples
 from ceed_data.example import (
     CHARTQA,
     DATASETS,
@@ -27,6 +28,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "CHARTQA",
+    "CORPUS_FILENAME",
     "DATASETS",
     "DOCVQA",
     "GQA",
@@ -45,5 +47,7 @@ __all__ = [
     "make_docvqa_example",
     "make_gqa_example",
     "normalize_box",
+    "read_examples",
     "split_corpus",
+    "write_examples",
 ]

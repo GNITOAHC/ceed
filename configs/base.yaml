@@ -13,7 +13,8 @@ layer_mapping:
     - [29, 39]
 
 extraction:
-  teacher_model: gemma-4-26B-A4B-it
+  # The Hugging Face repo id, lowercase as the hub and the local cache hold it.
+  teacher_model: google/gemma-4-26b-a4b-it
   model_revision: main
   layers: [9, 19, 29]
   ablation: mean-of-active

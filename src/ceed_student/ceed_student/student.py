@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from ceed_core import DecodingConfig
 
 
@@ -70,3 +72,50 @@ def load_student(
     enforce_greedy(model.generation_config, decoding)
     processor = AutoProcessor.from_pretrained(model_id)
     return model, processor
+
+
+class CeedStudent(torch.nn.Module):
+    """The real Student wired to the training loop's :class:`TrainableStudent` seam.
+
+    The loop needs one thing from a Student — the logits at the answer-token
+    positions under a given forward view — and this supplies it for the real
+    vision-language model. Everything else (parameters, ``state_dict``, device
+    placement) it inherits from being an ordinary module, which is what lets
+    ``accelerate`` and PEFT wrap it unchanged.
+
+    Only the original forward view is implemented. The intervened views belong to
+    the E-Groups and arrive with the intervention pipeline; asking for one here
+    fails loudly rather than silently scoring the wrong image.
+    """
+
+    def __init__(self, model: Any) -> None:
+        """Wrap an already-loaded vision-language model."""
+        super().__init__()
+        self.model = model
+
+    def answer_logits(self, batch: Any, view: Any) -> torch.Tensor:
+        """Return the Student's logits at the batch's answer-token positions.
+
+        Args:
+            batch: The training batch, whose ``student_inputs`` are run through
+                the model and whose ``answer_token_positions`` select the
+                positions the answer tokens are predicted at.
+            view: The forward view; only the original view is supported.
+
+        Returns:
+            The logits at the answer positions, ``[answer_tokens, vocab]``.
+
+        Raises:
+            NotImplementedError: If an intervened view is requested.
+        """
+        from ceed_student.auxiliary import ForwardView
+
+        if view is not ForwardView.ORIGINAL:
+            raise NotImplementedError(
+                f"the Student has no {view} forward; intervened views arrive with "
+                "the intervention pipeline"
+            )
+        outputs = self.model(**batch.student_inputs)
+        # The batch holds one example, so the leading batch axis is dropped
+        # before the answer positions are selected.
+        return outputs.logits[0][batch.answer_token_positions]

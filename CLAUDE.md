@@ -4,6 +4,11 @@ Causal Expert–Evidence Distillation: distilling the measured division of compu
 
 The research plan is `ceed.md`, amended by `docs/plan-amendments-v2.1.md`. The implementation spec is `.scratch/ceed/spec.md`.
 
+## Running the baselines
+
+To actually run and evaluate Groups B0, B1, and B2 — corpus assembly, teacher
+logit extraction, training, and scoring — see `docs/running-groups.md`.
+
 ## Development
 
 Everything runs through `uv`; never invoke `python` or `pytest` directly.

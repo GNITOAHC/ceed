@@ -150,6 +150,45 @@ def _move_batch(batch: TrainingBatch, device: Any) -> TrainingBatch:
     )
 
 
+def resolve_lora_targets(model: torch.nn.Module, leaf_names: Sequence[str]) -> list[str]:
+    """Return the full paths of adaptable modules matching ``leaf_names``.
+
+    PEFT matches target modules by name *suffix*, which is ambiguous on a
+    vision-language model: gemma-4 has a ``q_proj`` in the language model (a
+    plain ``nn.Linear``, adaptable) and another in the vision tower (wrapped in
+    ``Gemma4ClippableLinear``, which PEFT cannot adapt). Passing the bare leaf
+    name therefore matches both and fails.
+
+    Resolving to full paths of the modules PEFT actually supports keeps the
+    adapter on the language path — which is also the right scope for CEED, since
+    the distillation target is the reasoning path and a frozen vision tower is
+    the standard VLM fine-tuning choice.
+
+    Args:
+        model: The Student to scan.
+        leaf_names: The module leaf names to adapt, e.g. ``q_proj``.
+
+    Returns:
+        The full module paths to hand PEFT, in model order.
+
+    Raises:
+        ValueError: If no adaptable module matches, which would otherwise
+            produce an adapter that trains nothing.
+    """
+    wanted = set(leaf_names)
+    targets = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear) and name.rsplit(".", 1)[-1] in wanted
+    ]
+    if not targets:
+        raise ValueError(
+            f"no adaptable nn.Linear modules named {sorted(wanted)} in this Student; "
+            "LoRA would train nothing"
+        )
+    return targets
+
+
 def _apply_param_efficiency(
     student: torch.nn.Module,
     mode: ParamEfficiencyMode,
@@ -160,15 +199,18 @@ def _apply_param_efficiency(
     """Return the module to optimise for ``mode``.
 
     ``full`` returns the Student unchanged (every parameter trains). ``lora``
-    wraps it in a PEFT LoRA adapter over ``lora_targets`` and returns the wrapper
-    (only the adapter trains).
+    wraps it in a PEFT LoRA adapter over the adaptable modules matching
+    ``lora_targets`` and returns the wrapper (only the adapter trains).
     """
     if mode is ParamEfficiencyMode.FULL:
         return student
     from peft import LoraConfig, get_peft_model
 
     config = LoraConfig(
-        r=lora_rank, lora_alpha=lora_alpha, target_modules=list(lora_targets), lora_dropout=0.0
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=resolve_lora_targets(student, lora_targets),
+        lora_dropout=0.0,
     )
     return get_peft_model(student, config)  # type: ignore[arg-type]
 
@@ -228,6 +270,24 @@ class AccelerateTrainer:
         (checkpoint / PROGRESS_FILENAME).write_text(
             json.dumps({"completed_steps": completed, **metrics, **params})
         )
+
+    def _save_adapter(
+        self, accelerator: Any, model: Any, mode: ParamEfficiencyMode
+    ) -> None:  # pragma: no cover - PEFT save path needs a real adapter
+        """Write the trained LoRA adapter beside the checkpoint, if this was a LoRA run.
+
+        ``accelerate``'s state is what resumption reads; the adapter directory is
+        what *evaluation* reads, so a trained Group can be scored without
+        reconstructing the optimiser. A full fine-tune needs neither — its
+        weights are in the state itself.
+        """
+        if mode is not ParamEfficiencyMode.LORA:
+            return
+        unwrapped = accelerator.unwrap_model(model)
+        save = getattr(unwrapped, "save_pretrained", None)
+        if save is None:
+            return
+        save(str(self._checkpoint_dir() / "adapter"))
 
     def train(self, config: GroupConfig) -> TrainingOutcome:
         """Train the Group's Student on the backbone, resuming if a checkpoint exists.
@@ -325,6 +385,7 @@ class AccelerateTrainer:
         if steps_run > 0:
             accelerator.save_state(str(self._checkpoint_dir()))
             self._write_progress(training.steps, last, params)
+            self._save_adapter(accelerator, model, mode)
 
         return TrainingOutcome(
             param_efficiency=mode,
