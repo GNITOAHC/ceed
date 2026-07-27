@@ -20,6 +20,7 @@ fine-tuning.
 scripts/build_corpus.py           # once: assemble the shared corpus
 scripts/extract_teacher_logits.py # once per corpus: cache what B2 distils from
 scripts/run_group.py              # per Group: train (if it trains) and score
+scripts/infer.py                  # after a run: load the trained Student and query it
 ```
 
 ---
@@ -120,6 +121,127 @@ runs/
 trained**, layer mapping, both config hashes, the metrics, and the checkpoint
 path.
 
+---
+
+## Step 4 — Load a trained Group and run inference
+
+A finished B1 or B2 run leaves a checkpoint you can load and query. What a LoRA
+run writes is an **adapter** — about 9 MB — not a full model; loading it means
+loading the base Student and applying the adapter on top.
+
+```
+runs/checkpoints/b1/checkpoint/
+  adapter/                  # what inference loads (adapter_model.safetensors + config)
+  model.safetensors         # accelerate's state, for *resuming* training
+  optimizer.bin
+  progress.json             # completed_steps and the last loss
+```
+
+### From the command line
+
+`scripts/infer.py` handles the loading for you. Point it at a run directory and
+it reads the checkpoint path off the run record:
+
+```bash
+# replay held-out examples: prediction beside gold, with the score
+uv run python scripts/infer.py --run runs/<config_hash> --corpus data/corpus --limit 10
+
+# ask your own questions about an image
+uv run python scripts/infer.py --run runs/<config_hash> \
+    --image page.png \
+    --question "What is the total?" --question "Who signed it?"
+
+# the same questions against the *untrained* Student, to see what training changed
+uv run python scripts/infer.py --run runs/<config_hash> --image page.png \
+    --question "What is the total?" --base
+```
+
+`--checkpoint runs/checkpoints/b1/checkpoint` works too if you would rather name
+the checkpoint directly than go through a run record.
+
+### From Python
+
+`load_trained_student` is the one call — it loads the base Student, applies the
+Group's adapter, and returns a model ready to generate:
+
+```python
+from pathlib import Path
+
+from ceed_core import DecodingConfig, RunRecord
+from ceed_student import load_trained_student
+
+record = RunRecord.read(Path("runs/<config_hash>"))
+model, processor = load_trained_student(
+    "google/gemma-4-e4b-it",          # the base the Group trained from
+    Path(record.checkpoint_dir),      # the adapter to apply
+    DecodingConfig(max_new_tokens=64),
+)
+```
+
+Then decode an answer. Use `generate_answer` rather than hand-rolling a prompt —
+it renders the **same** prompt the Group was trained and scored under, so what
+you see is what the reported number measured:
+
+```python
+from ceed_data import Example, ImageStore
+from ceed_eval.direct import generate_answer
+
+image_store = ImageStore(Path("data/corpus/images"))
+example = Example(
+    example_id="docvqa:mine",
+    dataset="docvqa",
+    image_fingerprint=image_store.put(Path("page.png").read_bytes()),
+    question="What is the total?",
+    answers=("",),                    # unknown at inference time
+)
+print(generate_answer(model, processor, example, image_store, DecodingConfig(max_new_tokens=64)))
+```
+
+To score predictions as the harness does, add
+`ceed_eval.score_answer(dataset, prediction, golds)`.
+
+For the **untrained** Student (B0, or a before/after comparison) swap the loader
+and skip the adapter entirely:
+
+```python
+from ceed_student import load_student
+
+model, processor = load_student("google/gemma-4-e4b-it", DecodingConfig())
+model.eval()
+```
+
+### Why not `PeftModel.from_pretrained` directly
+
+The trainer saves the adapter from inside the `CeedStudent` wrapper, so the
+recorded module paths carry that wrapper's prefix and applying the adapter to a
+bare `AutoModelForImageTextToText` raises *"No modules were targeted for
+adaptation."* `load_trained_student` (and `apply_adapter`, if you already have a
+model loaded) re-wraps before loading and hands back the inner model, which still
+has the `generate` you need.
+
+### What a real B1 run looks like
+
+From the completed 2000-step B1 run in this repository (LoRA rank 4 — 2.27M
+trainable of 7.94B — scoring **0.792** ANLS on held-out DocVQA):
+
+```
+[OK  ] docvqa:49177
+       Q:    What time is 'question and answers' session?
+       pred: '12:25 to 12:58 p.m.'
+       gold: ['12:25 to 12:58 p.m.']   score 1.000
+[MISS] docvqa:57413
+       Q:    Name the 4 significant personal care brands of ITC?
+       pred: 'Sunfeast, Bingo!, Yippee!, Aim\n\n**Note:** ... it does not explicitly state ...'
+       gold: ['Essenza Di Wills, Fiama Di Wills, Vivel and Superia']   score 0.000
+```
+
+The miss shows the failure mode worth watching: on a question it cannot answer
+from the page, the Student abandons the short-answer instruction and starts
+reasoning aloud until `max_new_tokens` truncates it. That scores zero under ANLS
+even when the reasoning is sensible. It is a genuine model behaviour, not a
+harness bug — but if you see it often, raising `max_new_tokens` will *not* help,
+and the answers are worth reading rather than trusting the aggregate.
+
 ## Resuming
 
 Training checkpoints and resumes; a preempted Group is restarted with the same
@@ -200,6 +322,10 @@ otherwise silent.
 match this Student. gemma-4 keeps plain `nn.Linear` projections in the language
 model and `Gemma4ClippableLinear` (which PEFT cannot adapt) in the vision tower;
 targets are resolved to the language path automatically.
+
+**"No modules were targeted for adaptation"** when loading a trained checkpoint —
+you applied the adapter to a bare model. Use `load_trained_student` or
+`apply_adapter`; see *Why not `PeftModel.from_pretrained` directly* above.
 
 **CUDA OOM during extraction** — the 26B Teacher needs several cards; keep
 `--device-map auto` and do not pin it to one GPU.

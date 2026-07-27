@@ -129,9 +129,11 @@ class DirectEvaluator:
         if config.evaluation is None:
             raise ValueError(f"Group {config.group_code} declares no evaluation")
 
+        from ceed_student import apply_adapter
+
         model, processor = self.load_model(config)
         if self.checkpoint_dir is not None:
-            model = _apply_adapter(model, self.checkpoint_dir)
+            model = apply_adapter(model, self.checkpoint_dir)
         model.eval()
 
         decoding = config.evaluation.decoding
@@ -164,29 +166,3 @@ class DirectEvaluator:
             decoding=decoding,
             extra_metrics=extra,
         )
-
-
-def _apply_adapter(model: Any, checkpoint_dir: Path) -> Any:  # pragma: no cover - needs GPU
-    """Load a trained LoRA adapter onto the base Student, if one was written.
-
-    A full fine-tune writes its weights into the checkpoint itself and is loaded
-    by ``accelerate``; a LoRA run writes an adapter directory, which is what this
-    applies. A checkpoint with neither is returned unchanged, so scoring a Group
-    whose training produced no adapter is not an error.
-
-    The adapter's module paths were recorded relative to the
-    :class:`~ceed_student.student.CeedStudent` the trainer wrapped the model in,
-    so it is re-wrapped here to make the trees match. PEFT injects its layers
-    into the existing modules, so the inner model is returned adapted in place —
-    and still has the ``generate`` the evaluator decodes through.
-    """
-    adapter = checkpoint_dir / "adapter"
-    if not adapter.is_dir():
-        return model
-    from peft import PeftModel
-
-    from ceed_student import CeedStudent
-
-    wrapper = CeedStudent(model)
-    PeftModel.from_pretrained(wrapper, str(adapter))
-    return wrapper.model

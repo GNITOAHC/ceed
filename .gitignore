@@ -15,3 +15,8 @@ runs/
 store/
 wandb/
 outputs/
+
+# Assembled corpora: images and examples streamed from the source datasets, and
+# rebuildable by scripts/build_corpus.py from the recorded manifest.
+data/
+.ceed-infer-images/

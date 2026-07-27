@@ -13,6 +13,7 @@ real weights and a GPU and so runs out of the fast tier.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -71,6 +72,68 @@ def load_student(
     model = model.to(device)  # type: ignore[arg-type]
     enforce_greedy(model.generation_config, decoding)
     processor = AutoProcessor.from_pretrained(model_id)
+    return model, processor
+
+
+def apply_adapter(model: Any, checkpoint_dir: Path) -> Any:  # pragma: no cover - needs the weights
+    """Apply a Group's trained LoRA adapter to a loaded Student, in place.
+
+    The trainer saves the adapter from inside a :class:`CeedStudent`, so its
+    recorded module paths carry that wrapper's prefix. The model is therefore
+    re-wrapped here to make the trees line up. PEFT injects its layers into the
+    existing modules, so the *inner* model is returned — adapted, and still
+    carrying the ``generate`` that inference decodes through.
+
+    A checkpoint with no adapter directory (a full fine-tune, whose weights live
+    in the accelerate state) leaves the model unchanged rather than failing.
+
+    Args:
+        model: The loaded base Student.
+        checkpoint_dir: The Group's checkpoint directory.
+
+    Returns:
+        The Student with the adapter applied.
+    """
+    adapter = Path(checkpoint_dir) / "adapter"
+    if not adapter.is_dir():
+        return model
+    from peft import PeftModel
+
+    wrapper = CeedStudent(model)
+    PeftModel.from_pretrained(wrapper, str(adapter))
+    return wrapper.model
+
+
+def load_trained_student(
+    model_id: str,
+    checkpoint_dir: Path,
+    decoding: DecodingConfig | None = None,
+    dtype: str = "float16",
+    device: str = "cuda",
+) -> tuple[Any, Any]:  # pragma: no cover - needs the real weights and a GPU
+    """Load a Group's trained Student: the base checkpoint plus its adapter.
+
+    This is what to call to use a finished B1 or B2 run — the run record's
+    ``checkpoint_dir`` is the argument. B0 trained nothing, so it is loaded with
+    :func:`load_student` instead.
+
+    Args:
+        model_id: The base Student identifier the Group trained from.
+        checkpoint_dir: The Group's checkpoint directory, as recorded on the run
+            record.
+        decoding: The decoding settings to enforce; greedy defaults apply if
+            omitted.
+        dtype: The compute dtype.
+        device: The device to place the model on.
+
+    Returns:
+        The trained model and its processor, ready to generate.
+    """
+    model, processor = load_student(
+        model_id, decoding or DecodingConfig(), dtype=dtype, device=device
+    )
+    model = apply_adapter(model, checkpoint_dir)
+    model.eval()
     return model, processor
 
 

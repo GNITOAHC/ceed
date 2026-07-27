@@ -15,7 +15,13 @@ from ceed_student.backbone import BackboneLoss, backbone_loss
 from ceed_student.dataset import build_batches, encode_example, load_corpus_split
 from ceed_student.evaluation import EvaluationOutcome, Evaluator
 from ceed_student.run import run_group
-from ceed_student.student import CeedStudent, enforce_greedy, load_student
+from ceed_student.student import (
+    CeedStudent,
+    apply_adapter,
+    enforce_greedy,
+    load_student,
+    load_trained_student,
+)
 from ceed_student.training import (
     AccelerateTrainer,
     TrainableStudent,
@@ -40,6 +46,7 @@ __all__ = [
     "TrainingBatch",
     "TrainingOutcome",
     "WarmupSchedule",
+    "apply_adapter",
     "backbone_loss",
     "build_batches",
     "coupling_gate",
@@ -47,6 +54,7 @@ __all__ = [
     "enforce_greedy",
     "load_corpus_split",
     "load_student",
+    "load_trained_student",
     "required_artefact_kinds",
     "required_forward_views",
     "run_group",
