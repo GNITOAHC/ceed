@@ -20,3 +20,7 @@ outputs/
 # rebuildable by scripts/build_corpus.py from the recorded manifest.
 data/
 .ceed-infer-images/
+
+# Merged standalone checkpoints (~15 GB each), rebuildable by
+# scripts/merge_adapter.py from a run's adapter.
+merged/

@@ -21,6 +21,7 @@ scripts/build_corpus.py           # once: assemble the shared corpus
 scripts/extract_teacher_logits.py # once per corpus: cache what B2 distils from
 scripts/run_group.py              # per Group: train (if it trains) and score
 scripts/infer.py                  # after a run: load the trained Student and query it
+scripts/merge_adapter.py          # optional: fold the adapter into a standalone model
 ```
 
 ---
@@ -241,6 +242,77 @@ reasoning aloud until `max_new_tokens` truncates it. That scores zero under ANLS
 even when the reasoning is sensible. It is a genuine model behaviour, not a
 harness bug — but if you see it often, raising `max_new_tokens` will *not* help,
 and the answers are worth reading rather than trusting the aggregate.
+
+---
+
+## Step 5 — Merge the adapter into a standalone model (optional)
+
+A LoRA checkpoint is only meaningful next to its base model. To hand the trained
+Student to someone else, upload it to the Hub, or serve it with a backend that
+knows nothing about CEED, fold the adapter into the weights:
+
+```bash
+uv run python scripts/merge_adapter.py --run runs/<config_hash> \
+    --output merged/ceed-b1 --verify --corpus data/corpus --limit 8
+```
+
+The output is an ordinary Hugging Face checkpoint — same architecture, same
+config, same processor as `google/gemma-4-e4b-it`, different weight values:
+
+```
+merged/ceed-b1/
+  config.json  model.safetensors  generation_config.json
+  tokenizer.json  tokenizer_config.json  processor_config.json  chat_template.jinja
+  ceed_provenance.json      # which run these weights came from
+```
+
+Load it like any other model — no PEFT, no CEED imports:
+
+```python
+from transformers import AutoModelForImageTextToText, AutoProcessor
+
+model = AutoModelForImageTextToText.from_pretrained("merged/ceed-b1", dtype="float16")
+processor = AutoProcessor.from_pretrained("merged/ceed-b1")
+```
+
+Or upload it:
+
+```bash
+uv run huggingface-cli upload <your-org>/<your-repo> merged/ceed-b1
+```
+
+### Two things the script does deliberately
+
+**The merge runs in fp32 on CPU**, and the weights are cast to `--save-dtype`
+(default fp16) only once, on save. Folding `BA` into `W` at fp16 across 132
+projections accumulates rounding error; doing the arithmetic at full precision
+costs a few minutes of CPU and ~32 GB of RAM, and removes the question.
+
+**`--verify` reloads the result the way a downstream user would** — plain
+`from_pretrained`, no adapter, no wrapper — and re-scores it. That is the check
+that the merge preserved behaviour rather than merely producing a file.
+
+### Verified on the B1 run
+
+Merging this repository's 2000-step B1 run and scoring the merged checkpoint
+against the adapter path on the same 8 held-out examples produced **identical
+generations, token for token** — including a 60-token rambling miss — and the
+same 0.7500 mean. The merged model is a true drop-in.
+
+### Caveats
+
+- **Size.** The adapter is 9 MB; the merged checkpoint is ~15 GB per Group.
+- **It is still a LoRA result.** Merging does not turn a LoRA run into a full
+  fine-tune, and ADR-0005 turns on that distinction — so `ceed_provenance.json`
+  carries the source run's `config_hash`, `param_efficiency`, and metrics beside
+  the weights. Do not let a merged checkpoint become an unattributed number.
+- **Serving backends are a separate question.** The merged model is
+  architecturally indistinguishable from the base, so *any backend that can serve
+  `google/gemma-4-e4b-it` can serve it identically*. Whether a given backend
+  supports `Gemma4ForConditionalGeneration` — a multimodal architecture with a
+  text-side MoE block and Per-Layer Embeddings — is not something merging can
+  affect. Test the **stock base model** on your target backend first; if that
+  works, the merged checkpoint will too.
 
 ## Resuming
 
