@@ -36,9 +36,21 @@ written with a manifest recording exactly what went where.
 uv run python scripts/build_corpus.py --output data/corpus --limit 200
 ```
 
-- `--limit` is **per dataset**. Start small: the sources are gigabytes.
+- `--limit` is **per dataset**, and **zero or negative means the whole source
+  split**. Start small: the sources are gigabytes.
 - `--datasets docvqa gqa chartqa` selects sources (all three by default).
 - Splits are fixed at 80/10/10 train/validation/test, seeded by `--seed`.
+
+To take everything a source has:
+
+```bash
+uv run python scripts/build_corpus.py --output data/corpus-full --datasets docvqa --limit 0
+```
+
+Note which source split that is: `build_corpus.py` draws DocVQA from the source
+**validation** split (~5.3k questions), GQA and ChartQA from **train**. "Full
+DocVQA" therefore means that split, not the ~39k DocVQA train split, and the
+80/10/10 re-split applies on top of it.
 
 Produces:
 
@@ -102,6 +114,20 @@ Useful flags:
 | `--param-efficiency lora\|full` | Override the mode — see the warning below |
 | `--skip-eval` | Train only |
 | `--eval-split` | Defaults to `validation`; use `test` only for final numbers |
+
+Note that `--limit` and `--train-limit` are different flags: `--limit` caps only
+what is *scored*. **To train on the whole corpus, omit `--train-limit`** — it
+defaults to no cap. The corpus's own size is fixed earlier, by step 1.
+
+Two things about the step budget, as the loop currently stands:
+
+- **One step consumes one example.** `--steps` is therefore a count of examples
+  seen, not of batches: seeing a 4,000-example corpus once means `--steps 4000`.
+  The `batch_size` field in the Group's YAML is not yet read by the training
+  loop.
+- **Batches are encoded up front and held in memory** — roughly 8 MB per example
+  on DocVQA, dominated by pixel values. A few thousand examples is tens of GB
+  resident, and the encoding pass before training starts is not quick.
 
 What the script builds is decided by the Group's config, not by flags: a Group
 with no `training:` block never constructs a trainer, and a Group whose

@@ -58,10 +58,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=200,
-        help="examples per dataset (keep small first; the sources are gigabytes)",
+        help=(
+            "examples per dataset; zero or negative means the whole source split "
+            "(keep small first — the sources are gigabytes)"
+        ),
     )
     parser.add_argument("--seed", type=int, default=0, help="the recorded split seed")
     return parser.parse_args(argv)
+
+
+def resolve_limit(limit: int) -> int | None:
+    """Translate the ``--limit`` flag into the loaders' cap.
+
+    The loaders take ``None`` for "no cap" and stop at ``index >= limit``
+    otherwise, which makes a literal ``0`` mean *zero examples* — an empty
+    corpus, silently. Since nobody asks for an empty corpus and everybody
+    eventually asks for a whole one, any non-positive value is read as "take
+    everything".
+
+    Args:
+        limit: The value passed on the command line.
+
+    Returns:
+        ``None`` to take the whole source split, or the positive cap.
+    """
+    return None if limit <= 0 else limit
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -70,12 +91,15 @@ def main(argv: list[str] | None = None) -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     image_store = ImageStore(args.output / "images")
 
+    limit = resolve_limit(args.limit)
+    described = "no limit" if limit is None else f"limit {limit}"
+
     examples = []
     for dataset in args.datasets:
         source_split = SOURCE_SPLITS[dataset]
-        print(f"[corpus] streaming {dataset} ({source_split}), limit {args.limit} ...", flush=True)
+        print(f"[corpus] streaming {dataset} ({source_split}), {described} ...", flush=True)
         try:
-            for example in LOADERS[dataset](source_split, image_store, limit=args.limit):
+            for example in LOADERS[dataset](source_split, image_store, limit=limit):
                 examples.append(example)
         except Exception as error:
             print(f"[corpus] WARNING: {dataset} failed: {error}", file=sys.stderr)
