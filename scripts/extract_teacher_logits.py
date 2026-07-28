@@ -49,7 +49,7 @@ TOP_K_LOGIT_VALUES = "top_k_logit_values"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--corpus", type=Path, default=Path("data/corpus"))
     parser.add_argument("--store", type=Path, default=Path("data/store"))
     parser.add_argument("--configs", type=Path, default=Path("configs"))

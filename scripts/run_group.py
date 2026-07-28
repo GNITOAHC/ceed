@@ -42,7 +42,7 @@ from ceed_student import AccelerateTrainer, CeedStudent, build_batches, run_grou
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--group", required=True, help="group overlay name, e.g. b0, b1, b2")
     parser.add_argument("--configs", type=Path, default=Path("configs"))
     parser.add_argument("--corpus", type=Path, default=Path("data/corpus"))

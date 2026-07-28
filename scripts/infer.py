@@ -34,7 +34,7 @@ from ceed_core import DecodingConfig, RunRecord
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run", type=Path, help="a run directory holding run_record.json")
     source.add_argument("--checkpoint", type=Path, help="a checkpoint directory")

@@ -43,7 +43,7 @@ PROVENANCE_FILENAME = "ceed_provenance.json"
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run", type=Path, help="a run directory holding run_record.json")
     source.add_argument("--checkpoint", type=Path, help="a checkpoint directory")
@@ -128,7 +128,7 @@ def merge(base_model_id: str, checkpoint: Path, save_dtype: str) -> tuple[Any, A
     peft_model = PeftModel.from_pretrained(wrapper, str(adapter), torch_dtype=torch.float32)
 
     print("[merge] folding LoRA weights into the base weights ...", flush=True)
-    merged_wrapper = peft_model.merge_and_unload()
+    merged_wrapper = peft_model.merge_and_unload()  # type: ignore[reportCallIssue]
     merged = merged_wrapper.model  # unwrap CeedStudent: a plain HF model again
 
     print(f"[merge] casting merged weights to {save_dtype}")

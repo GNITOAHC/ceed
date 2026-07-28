@@ -43,7 +43,7 @@ SOURCE_SPLITS = {"docvqa": "validation", "gqa": "train", "chartqa": "train"}
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument(
         "--output", type=Path, default=Path("data/corpus"), help="corpus directory to write"
     )
