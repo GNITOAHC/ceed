@@ -239,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[merge] done. {args.output} is a standalone {args.model.split('/')[-1]}-shaped model.")
     print("[merge] load it with AutoModelForImageTextToText.from_pretrained(...), or upload:")
-    print(f"[merge]   uv run huggingface-cli upload <your-repo> {args.output}")
+    print(f"[merge]   uv run hf upload <your-repo> {args.output} .")
     if record is not None and record.param_efficiency.value == "lora":
         print(
             "[merge] NOTE: these weights came from a LoRA run. Merging does not make "

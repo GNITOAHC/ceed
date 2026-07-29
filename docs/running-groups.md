@@ -304,8 +304,14 @@ processor = AutoProcessor.from_pretrained("merged/ceed-b1")
 Or upload it:
 
 ```bash
-uv run huggingface-cli upload <your-org>/<your-repo> merged/ceed-b1
+uv run hf upload <your-org>/<your-repo> merged/ceed-b1 .
 ```
+
+The trailing `.` is the path *in the repo*, and it matters: it defaults to the
+local path, so omitting it puts the checkpoint in a `merged/ceed-b1/`
+subdirectory of the repo rather than at the root, where `from_pretrained` will
+not find it. Add `--private` if the repo does not exist yet and should not be
+public — the flag is ignored once the repo exists.
 
 ### Two things the script does deliberately
 
