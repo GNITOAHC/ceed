@@ -226,7 +226,8 @@ def test_the_auxiliary_signal_actually_changes_the_optimised_loss(group, tmp_pat
 
     backbone_total = outcome.backbone_metrics["cross_entropy"] + outcome.backbone_metrics["kd"]
     assert outcome.final_loss != pytest.approx(backbone_total)
-    assert sum(outcome.auxiliary_metrics.values()) > 0
+    # B4's term is a signed redistribution, so magnitude is what matters here.
+    assert any(value != 0.0 for value in outcome.auxiliary_metrics.values())
 
 
 def test_the_warmup_holds_a_probing_signal_out_of_the_first_steps(b5_config, tmp_path):
@@ -307,3 +308,40 @@ def test_every_baseline_group_from_b0_to_b5_resolves(configs_dir):
         codes.append(config.group_code)
         assert config.evaluation is not None  # every baseline reports accuracy
     assert codes == ["B0", "B1", "B2", "B3", "B4", "B5"]
+
+
+# -- the already-trained baselines keep their identity -----------------------
+
+# The hashes of the Groups that have been trained and whose checkpoints are on
+# disk. A run hash is a pure function of the whole configuration, so *any* new
+# field with a default, anywhere in the schema, silently changes them — and a
+# changed hash means a completed baseline is no longer found, is retrained from
+# zero, and no longer matches the provenance published beside its weights.
+FROZEN_BASELINE_HASHES = {
+    "b0": "1a02a200659d7494d858b3807b94c2edd759c20fccc607321f76ea79a7976b9b",
+    "b1": "a152004ac6dd3cc8986e5c00e200965d4e4c64044ea021c827eed65f46df527d",
+    "b2": "335406898cb860fe39d89d91c77b321370f7d5bb226b606febe40cbd44db2743",
+}
+
+
+@pytest.mark.parametrize(("group", "expected"), sorted(FROZEN_BASELINE_HASHES.items()))
+def test_a_trained_baselines_run_hash_does_not_drift(group, expected, configs_dir):
+    """Adding a Group must not change the identity of the Groups already run.
+
+    B0, B1 and B2 have run; B2's hash is published in the provenance of a merged
+    checkpoint. Extending the schema for B3 to B5 must leave all three untouched,
+    and this is the only thing that says so before the retraining bill arrives.
+
+    If this fails, the fix is almost never to update the constant — it is to stop
+    the new field reaching a Group that does not use it.
+    """
+    from ceed_core import resolve_group_config, run_hash
+
+    config = resolve_group_config(
+        [
+            configs_dir / "base.yaml",
+            configs_dir / "student.yaml",
+            configs_dir / "groups" / f"{group}.yaml",
+        ]
+    )
+    assert run_hash(config) == expected

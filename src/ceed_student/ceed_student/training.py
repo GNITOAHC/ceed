@@ -491,7 +491,7 @@ class AccelerateTrainer:
                 kd_weight=training.backbone.kd_weight,
                 temperature=training.backbone.kd_temperature,
             )
-            terms = aux_terms(signals, context, training.coupling_threshold)
+            terms = aux_terms(signals, context)
             loss = training_loss(backbone, terms, step=step, schedule=schedule)
 
             optimizer.zero_grad()

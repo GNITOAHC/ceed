@@ -175,10 +175,6 @@ class TrainingConfig(_Frozen):
             only at the end. Resumption reads the most recent checkpoint.
         backbone: The shared backbone objective's weighting.
         warmup: The auxiliary-signal warm-up schedule.
-        coupling_threshold: The teacher-measured coupling strength an answer
-            token must exceed for an auxiliary signal to supervise it, so that
-            supervision concentrates where the teacher shows evidence-computation
-            coupling. Inert for a Group whose extraction cached no coupling.
     """
 
     steps: int = Field(gt=0)
@@ -187,7 +183,6 @@ class TrainingConfig(_Frozen):
     checkpoint_every: int = Field(default=0, ge=0)
     backbone: BackboneConfig = BackboneConfig()
     warmup: WarmupConfig = WarmupConfig()
-    coupling_threshold: float = 0.0
 
 
 class SignalOptions(_Frozen):

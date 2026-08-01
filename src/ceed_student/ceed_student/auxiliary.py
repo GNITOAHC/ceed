@@ -131,6 +131,11 @@ def required_forward_views(signals: Sequence[AuxiliarySignal]) -> frozenset[Forw
 def verify_store_supports(metadata: StoreMetadata, signals: Sequence[AuxiliarySignal]) -> None:
     """Fail fast unless the store supplies every artefact kind the signals need.
 
+    :func:`ceed_student.signals.build_signals` makes the equivalent check earlier,
+    from the Group's *declared* signal names, so a Group never reaches signal
+    construction unverified. This is the same check for a caller that already
+    holds constructed signals.
+
     Args:
         metadata: The artifact store's metadata, declaring the kinds it holds.
         signals: The Group's auxiliary signals.

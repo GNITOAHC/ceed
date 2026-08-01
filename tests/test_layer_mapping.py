@@ -61,7 +61,9 @@ def test_a_negative_layer_index_is_refused():
 
 
 def test_an_unknown_kind_is_refused():
-    with pytest.raises(ValidationError, match="kind must be one of"):
+    # The three kinds are a closed set: C2's control is defined by being one of
+    # them, so a mapping labelled anything else has no defined meaning.
+    with pytest.raises(ValidationError, match="handwritten"):
         LayerMapping(kind="handwritten", pairs=((9, 12),))
 
 

@@ -160,6 +160,38 @@ def test_a_single_answer_token_is_not_split_into_groups():
     assert torch.equal(va_group_weights(torch.tensor([2.0])), torch.ones(1))
 
 
+def _b4_case():
+    """Logits, a cached teacher top-k, and an advantage concentrated on one token."""
+    logits = torch.tensor([[2.0, 0.5, 0.1, 0.0], [0.2, 3.0, 0.1, 0.0], [0.0, 0.0, 1.0, 2.0]])
+    ids = torch.tensor([[0, 1], [1, 2], [3, 2]])
+    values = torch.tensor([[4.0, 1.0], [3.0, 2.0], [5.0, 0.5]])
+    advantage = torch.tensor([[0.0], [0.0], [4.0]])
+    return logits, ids, values, advantage
+
+
+def test_b4s_step_loss_is_exactly_the_papers_grouped_loss():
+    """backbone + signal == mean(w * KL), term for term.
+
+    The signal cannot return the reweighted loss itself: the backbone has already
+    contributed mean(KL), so B4 would optimise mean(KL) + mean(w*KL) — twice B2's
+    distillation weight, with the paper's 4:1 token ratio flattened to 2.15:1.
+    Both runs complete and both produce a plausible number, which is exactly why
+    this is pinned here.
+    """
+    from ceed_student.backbone import topk_kd_per_token
+
+    logits, ids, values, advantage = _b4_case()
+    signal = VisualAdvantageSignal(1.0, SignalOptions(), temperature=2.0)
+    context = a_context(artefacts={VISUAL_ADVANTAGE: advantage}, logits=logits, topk=(ids, values))
+
+    divergence = topk_kd_per_token(logits, ids, values, temperature=2.0)
+    backbone_kd = divergence.mean()  # what the shared backbone contributes
+    weights = va_group_weights(advantage.reshape(-1))
+
+    step = backbone_kd + signal.token_loss(context).mean()
+    assert step == pytest.approx(float((weights * divergence).mean()), rel=1e-6)
+
+
 def test_b4_reweights_the_backbones_own_divergence_and_nothing_else():
     """B4 differs from B2 in the weighting alone.
 
@@ -169,17 +201,28 @@ def test_b4_reweights_the_backbones_own_divergence_and_nothing_else():
     """
     from ceed_student.backbone import topk_kd_per_token
 
-    logits = torch.tensor([[2.0, 0.5, 0.1, 0.0], [0.2, 3.0, 0.1, 0.0], [0.0, 0.0, 1.0, 2.0]])
-    ids = torch.tensor([[0, 1], [1, 2], [3, 2]])
-    values = torch.tensor([[4.0, 1.0], [3.0, 2.0], [5.0, 0.5]])
-    advantage = torch.tensor([[0.0], [0.0], [4.0]])
-
+    logits, ids, values, advantage = _b4_case()
     signal = VisualAdvantageSignal(1.0, SignalOptions(), temperature=2.0)
     context = a_context(artefacts={VISUAL_ADVANTAGE: advantage}, logits=logits, topk=(ids, values))
 
     divergence = topk_kd_per_token(logits, ids, values, temperature=2.0)
-    expected = va_group_weights(advantage.reshape(-1)) * divergence
+    expected = (va_group_weights(advantage.reshape(-1)) - 1.0) * divergence
     assert torch.allclose(signal.token_loss(context), expected)
+
+
+def test_b4_is_exactly_b2_on_an_example_with_no_visual_advantage():
+    """The fallback must be a true no-op, not an approximate one.
+
+    Where VA-OPD's premise does not hold the weights come back uniform, and the
+    residual is then identically zero — so B4's objective on that example is B2's,
+    to the bit.
+    """
+    logits, ids, values, _ = _b4_case()
+    signal = VisualAdvantageSignal(1.0, SignalOptions(), temperature=2.0)
+    context = a_context(
+        artefacts={VISUAL_ADVANTAGE: torch.zeros(3, 1)}, logits=logits, topk=(ids, values)
+    )
+    assert torch.equal(signal.token_loss(context), torch.zeros(3))
 
 
 def test_b4_needs_no_hidden_states_and_carries_no_parameters():

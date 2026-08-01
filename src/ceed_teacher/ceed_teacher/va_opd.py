@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from torch import Tensor
 
 VISUAL_ADVANTAGE = "visual_advantage"
@@ -99,7 +99,7 @@ def visual_advantage(
 
 
 def gold_logprobs(
-    logits: Float[Tensor, "positions vocab"], gold_token_ids: Float[Tensor, " tokens"]
+    logits: Float[Tensor, "positions vocab"], gold_token_ids: Int[Tensor, " tokens"]
 ) -> Float[Tensor, " tokens"]:
     """Return the teacher's log-probability of each gold token at its position.
 

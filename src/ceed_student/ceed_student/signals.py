@@ -27,15 +27,23 @@ so.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 import torch
 from jaxtyping import Float
 from torch import Tensor
 from torch.nn import functional
 
-from ceed_core import ArtifactStore, GroupConfig, LayerMapping, SignalOptions, VectorSpec
-from ceed_student.auxiliary import AuxiliarySignal, ForwardView, verify_store_supports
+from ceed_core import (
+    ArtifactStore,
+    AuxiliarySignalConfig,
+    GroupConfig,
+    LayerMapping,
+    SignalOptions,
+    VectorSpec,
+)
+from ceed_student.auxiliary import AuxiliarySignal, ForwardView
 from ceed_student.backbone import topk_kd_per_token
 from ceed_student.training import SignalContext
 
@@ -80,18 +88,18 @@ class _MappedSignal(torch.nn.Module):
         return frozenset(self.mapping.student_layers)
 
     def _student_hidden(
-        self, context: SignalContext, teacher_layer: int, head: torch.nn.Module
+        self, context: SignalContext, teacher_layer: int, probe: torch.nn.Module
     ) -> Tensor:
-        """Return the Student's state at the mapped layer, in the head's precision.
+        """Return the Student's state at the mapped layer, in the probe's precision.
 
         The Student runs in fp16 (Volta has no bf16, ADR-0006) but a probe is
         small enough to keep in fp32, so its input is widened rather than the
         probe narrowed. That is deliberate: the auxiliary loss and the gradients
         flowing back through it are then computed at full precision, where a
-        half-precision head would be optimising against its own rounding.
+        half-precision probe would be optimising against its own rounding.
         """
         hidden = context.original.hidden_states[self.mapping.student_layer_for(teacher_layer)]
-        return hidden.to(next(head.parameters()).dtype)
+        return hidden.to(next(probe.parameters()).dtype)
 
 
 class HiddenStateProjectionSignal(_MappedSignal):
@@ -295,8 +303,18 @@ class VisualAdvantageSignal(torch.nn.Module):
     deliberate: B4 must differ from B2 in the weighting and in nothing else, or
     the comparison measures two changes at once.
 
+    **The signal is the residual, not the reweighted loss.** Every Group's step
+    loss is ``backbone + Σ scale·weight·signal``, and the backbone has already
+    contributed ``mean(KL)``. Returning ``w·KL`` here would therefore optimise
+    ``mean(KL) + mean(w·KL)`` — twice B2's distillation weight, and a high-to-low
+    token ratio of 2.15 where the paper's is 4. Returning ``(w - 1)·KL`` makes the
+    sum exactly VA-OPD's ``L_group = λ·mean_V(KL) + (1-λ)·mean_L(KL)``, leaves
+    B4's backbone configuration identical to B2's, and makes B4 reduce to B2
+    exactly on any example whose weights come back uniform.
+
     The signal has no parameters — it is pure reweighting — so unlike B3 and B5
-    it adds nothing to the optimiser.
+    it adds nothing to the optimiser. Its recorded metric is a redistribution and
+    is signed: negative means the loss moved off this example's tokens on balance.
     """
 
     def __init__(self, weight: float, options: SignalOptions, temperature: float) -> None:
@@ -329,7 +347,7 @@ class VisualAdvantageSignal(torch.nn.Module):
         return frozenset()
 
     def token_loss(self, context: SignalContext) -> Float[Tensor, " tokens"]:
-        """Return the distillation divergence, reweighted by visual advantage."""
+        """Return what the reweighting adds to the backbone's own distillation term."""
         batch = context.batch
         advantage = context.artefact(VISUAL_ADVANTAGE).reshape(-1).float()
         divergence = topk_kd_per_token(
@@ -339,7 +357,9 @@ class VisualAdvantageSignal(torch.nn.Module):
             self.temperature,
         )
         weights = va_group_weights(advantage, self.top_fraction, self.high_weight)
-        return weights.to(divergence.dtype) * divergence
+        # The residual: the backbone already contributed mean(KL), so adding
+        # (w - 1)*KL leaves exactly mean(w*KL), the paper's grouped loss.
+        return (weights.to(divergence.dtype) - 1.0) * divergence
 
 
 def signal_artefact_kinds(config: GroupConfig) -> list[str]:
@@ -361,7 +381,7 @@ def signal_artefact_kinds(config: GroupConfig) -> list[str]:
     """
     kinds: set[str] = set()
     for declared in config.auxiliary_signals:
-        kinds |= set(_kinds_for(declared.name, config.group_code))
+        kinds |= _SIGNALS[_known(declared.name, config.group_code)].kinds
     return sorted(kinds)
 
 
@@ -395,61 +415,79 @@ def build_signals(
     """
     if not config.auxiliary_signals:
         return []
+    if store is None:
+        raise ValueError(
+            f"Group {config.group_code} declares signal(s) reading "
+            f"{signal_artefact_kinds(config)} but no artifact store was supplied; "
+            "run teacher extraction first"
+        )
+    # Every declared kind, checked in one go before anything is constructed, so
+    # the message names everything that is missing rather than the first of them.
+    store.metadata.require_kinds(signal_artefact_kinds(config))
 
-    mapping = config.layer_mapping
-    temperature = config.training.backbone.kd_temperature if config.training else 1.0
-
-    def spec_for(kind: str) -> VectorSpec:
-        if store is None:
-            raise ValueError(
-                f"Group {config.group_code} declares a signal reading {kind!r} but no "
-                "artifact store was supplied; run teacher extraction first"
-            )
-        return store.metadata.vector_kinds[kind]
-
-    signals: list[AuxiliarySignal] = []
-    for declared in config.auxiliary_signals:
-        if store is not None:
-            store.metadata.require_kinds(_kinds_for(declared.name, config.group_code))
-        if declared.name == HIDDEN_STATE_PROJECTION:
-            signals.append(
-                HiddenStateProjectionSignal(
-                    declared.weight, mapping, spec_for(HIDDEN_STATES), student_hidden_size
-                )
-            )
-        elif declared.name == COMBINE_WEIGHT_PROBE:
-            signals.append(
-                CombineWeightProbeSignal(
-                    declared.weight, mapping, spec_for(COMBINE_WEIGHTS), student_hidden_size
-                )
-            )
-        elif declared.name == VISUAL_ADVANTAGE_REWEIGHTING:
-            spec_for(VISUAL_ADVANTAGE)  # present-or-fail, though its shape is not needed
-            signals.append(VisualAdvantageSignal(declared.weight, declared.options, temperature))
-        else:
-            raise ValueError(
-                f"Group {config.group_code} declares unknown auxiliary signal "
-                f"{declared.name!r}; known signals are {sorted(SIGNAL_KINDS)}"
-            )
-
-    if store is not None:
-        verify_store_supports(store.metadata, signals)
-    return signals
+    context = _BuildContext(
+        mapping=config.layer_mapping,
+        student_hidden_size=student_hidden_size,
+        temperature=config.training.backbone.kd_temperature if config.training else 1.0,
+        specs=store.metadata.vector_kinds,
+    )
+    return [
+        _SIGNALS[_known(declared.name, config.group_code)].build(declared, context)
+        for declared in config.auxiliary_signals
+    ]
 
 
-# What each signal name needs from the store, so an unbuildable Group is refused
-# before anything is constructed.
-SIGNAL_KINDS: dict[str, frozenset[str]] = {
-    HIDDEN_STATE_PROJECTION: frozenset({HIDDEN_STATES}),
-    COMBINE_WEIGHT_PROBE: frozenset({COMBINE_WEIGHTS}),
-    VISUAL_ADVANTAGE_REWEIGHTING: frozenset({VISUAL_ADVANTAGE}),
+@dataclass(frozen=True)
+class _BuildContext:
+    """What every signal's constructor draws on, whichever signal it is."""
+
+    mapping: LayerMapping
+    student_hidden_size: int
+    temperature: float
+    specs: Mapping[str, VectorSpec]
+
+
+@dataclass(frozen=True)
+class _Component:
+    """One implemented signal: what it reads, and how to construct it.
+
+    Registering a signal here — rather than in a branch — is what keeps adding a
+    Group to a component and a YAML overlay. The ``kinds`` are declared
+    separately from the constructor because the dataloader needs them before a
+    Student exists to size probes against.
+    """
+
+    kinds: frozenset[str]
+    build: Callable[[AuxiliarySignalConfig, _BuildContext], AuxiliarySignal]
+
+
+_SIGNALS: dict[str, _Component] = {
+    HIDDEN_STATE_PROJECTION: _Component(
+        kinds=frozenset({HIDDEN_STATES}),
+        build=lambda declared, ctx: HiddenStateProjectionSignal(
+            declared.weight, ctx.mapping, ctx.specs[HIDDEN_STATES], ctx.student_hidden_size
+        ),
+    ),
+    COMBINE_WEIGHT_PROBE: _Component(
+        kinds=frozenset({COMBINE_WEIGHTS}),
+        build=lambda declared, ctx: CombineWeightProbeSignal(
+            declared.weight, ctx.mapping, ctx.specs[COMBINE_WEIGHTS], ctx.student_hidden_size
+        ),
+    ),
+    VISUAL_ADVANTAGE_REWEIGHTING: _Component(
+        kinds=frozenset({VISUAL_ADVANTAGE}),
+        build=lambda declared, ctx: VisualAdvantageSignal(
+            declared.weight, declared.options, ctx.temperature
+        ),
+    ),
 }
 
 
-def _kinds_for(name: str, group_code: str) -> Sequence[str]:
-    if name not in SIGNAL_KINDS:
+def _known(name: str, group_code: str) -> str:
+    """Return ``name`` if a component implements it, else say what does exist."""
+    if name not in _SIGNALS:
         raise ValueError(
             f"Group {group_code} declares unknown auxiliary signal {name!r}; "
-            f"known signals are {sorted(SIGNAL_KINDS)}"
+            f"known signals are {sorted(_SIGNALS)}"
         )
-    return sorted(SIGNAL_KINDS[name])
+    return name

@@ -63,17 +63,20 @@ from ceed_core.config import (
     merge_overlays,
 )
 from ceed_data.manifest import CorpusManifest
+from ceed_teacher.extraction import (
+    COMBINE_WEIGHTS,
+    HIDDEN_STATES,
+    TOP_K_LOGIT_IDS,
+    TOP_K_LOGIT_VALUES,
+    VISUAL_ADVANTAGE,
+    ExtractionSpec,
+    store_schema,
+)
 from ceed_teacher.router import capture_combine_weights, hybrid_layers, stack_layers
 from ceed_teacher.va_opd import degrade_image, gold_logprobs, visual_advantage
 
-from ceed_core import ArtifactRow, ArtifactStore, StoreMetadata, VectorSpec, store_root
+from ceed_core import ArtifactRow, ArtifactStore, StoreMetadata, store_root
 from ceed_data import CORPUS_FILENAME, ImageStore, read_examples
-
-TOP_K_LOGIT_IDS = "top_k_logit_ids"
-TOP_K_LOGIT_VALUES = "top_k_logit_values"
-HIDDEN_STATES = "hidden_states"
-COMBINE_WEIGHTS = "combine_weights"
-VISUAL_ADVANTAGE = "visual_advantage"
 
 # The six candidate layers hidden states are cached at: spread across the
 # Teacher's 30 and including all three of base.yaml's CEA layers, so B3 and the
@@ -279,11 +282,17 @@ def extract_example(
     processor: Any,
     example: Any,
     image_store: ImageStore,
-    args: argparse.Namespace,
-    combine_weight_layers: tuple[int, ...],
+    spec: ExtractionSpec,
     n_experts: int,
+    max_new_tokens: int,
+    skip_correctness: bool,
 ) -> list[ArtifactRow]:
-    """Return one artefact row per answer token of this example."""
+    """Return one artefact row per answer token of this example.
+
+    What is cached is entirely ``spec``: a kind whose layer tuple is empty is not
+    computed, so a store built for the logit-KD Groups pays nothing for B3's
+    hidden states or B4's second forward.
+    """
     inputs, prompt_length, answer_ids = build_inputs(processor, example, image_store)
     n_answer = int(answer_ids.shape[0])
     if n_answer == 0:
@@ -291,14 +300,14 @@ def extract_example(
 
     on_device = to_device(inputs, model.device)
     capture: Any = (
-        capture_combine_weights(model, n_experts) if args.with_combine_weights else nullcontext({})
+        capture_combine_weights(model, n_experts) if spec.combine_weight_layers else nullcontext({})
     )
     with capture as captured, torch.no_grad():
-        outputs = model(**on_device, output_hidden_states=args.with_hidden_states)
+        outputs = model(**on_device, output_hidden_states=bool(spec.hidden_state_layers))
     logits = outputs.logits[0].float()
 
     advantage = None
-    if args.with_visual_advantage:
+    if spec.visual_advantage:
         original = gold_logprobs(
             logits[answer_slice(prompt_length, n_answer)], answer_ids.to(logits.device)
         )
@@ -310,24 +319,24 @@ def extract_example(
     rows: list[ArtifactRow] = []
     for ordinal in range(n_answer):
         measurement = prompt_length - 1 + ordinal
-        top = torch.topk(logits[measurement], args.top_k)
+        top = torch.topk(logits[measurement], spec.top_k)
         vectors: dict[str, np.ndarray] = {
             TOP_K_LOGIT_IDS: top.indices.cpu().numpy().astype(np.int32),
             TOP_K_LOGIT_VALUES: top.values.cpu().numpy().astype(np.float32),
         }
-        if args.with_hidden_states:
+        if spec.hidden_state_layers:
             # hidden_states[0] is the embedding output, so layer L is index L + 1.
             # Each layer's state is moved to the CPU before stacking: a Teacher
             # sharded across GPUs returns them on the device its layer sits on.
             stacked = torch.stack(
                 [
                     outputs.hidden_states[layer + 1][0][measurement].float().cpu()
-                    for layer in args.hidden_state_layers
+                    for layer in spec.hidden_state_layers
                 ]
             )
             vectors[HIDDEN_STATES] = stacked.numpy().astype(np.float16)
-        if args.with_combine_weights:
-            weights = stack_layers(captured, combine_weight_layers, measurement)
+        if spec.combine_weight_layers:
+            weights = stack_layers(captured, spec.combine_weight_layers, measurement)
             vectors[COMBINE_WEIGHTS] = weights.numpy().astype(np.float16)
         if advantage is not None:
             vectors[VISUAL_ADVANTAGE] = advantage[ordinal].reshape(1).numpy().astype(np.float32)
@@ -342,14 +351,14 @@ def extract_example(
         )
 
     correct = False
-    if not args.skip_correctness:
+    if not skip_correctness:
         prompt_only = {
             k: (v[:, :prompt_length] if k in {"input_ids", "attention_mask"} else v)
             for k, v in on_device.items()
         }
         with torch.no_grad():
             generated = model.generate(
-                **prompt_only, max_new_tokens=args.max_new_tokens, do_sample=False, num_beams=1
+                **prompt_only, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1
             )
         answer = processor.decode(generated[0][prompt_length:], skip_special_tokens=True).strip()
         correct = answer.lower() == example.answers[0].strip().lower()
@@ -359,36 +368,27 @@ def extract_example(
     return [replace(row, correct=correct) for row in rows]
 
 
-def build_metadata(
-    args: argparse.Namespace,
-    fingerprint: str,
-    manifest: CorpusManifest,
-    combine_weight_layers: tuple[int, ...],
-    n_experts: int,
-    hidden_size: int,
-) -> StoreMetadata:
-    """Describe the store this run writes: its kinds, their shapes, their layers."""
-    kinds = {
-        TOP_K_LOGIT_IDS: VectorSpec(dtype="int32", shape=(args.top_k,)),
-        TOP_K_LOGIT_VALUES: VectorSpec(dtype="float32", shape=(args.top_k,)),
-    }
-    if args.with_hidden_states:
-        layers = tuple(args.hidden_state_layers)
-        kinds[HIDDEN_STATES] = VectorSpec(
-            dtype="float16", shape=(len(layers), hidden_size), layers=layers
-        )
-    if args.with_combine_weights:
-        kinds[COMBINE_WEIGHTS] = VectorSpec(
-            dtype="float16",
-            shape=(len(combine_weight_layers), n_experts),
-            layers=combine_weight_layers,
-        )
-    if args.with_visual_advantage:
-        kinds[VISUAL_ADVANTAGE] = VectorSpec(dtype="float32", shape=(1,))
-    return StoreMetadata(
-        extraction_fingerprint=fingerprint,
-        vector_kinds=kinds,
-        corpus_manifest=manifest.model_dump(mode="json"),
+def build_spec(args: argparse.Namespace, n_hybrid_layers: int) -> ExtractionSpec:
+    """Turn the command line into the one description of what this run caches.
+
+    The ``--with-*`` flags exist because they read well on a command line; from
+    here on there is a single :class:`~ceed_teacher.extraction.ExtractionSpec`,
+    and both the store's schema and the per-example extraction are derived from
+    it — so the columns declared and the columns written cannot disagree.
+    """
+    return ExtractionSpec(
+        top_k=args.top_k,
+        combine_weight_layers=(
+            tuple(
+                args.combine_weight_layers
+                if args.combine_weight_layers is not None
+                else range(n_hybrid_layers)
+            )
+            if args.with_combine_weights
+            else ()
+        ),
+        hidden_state_layers=tuple(args.hidden_state_layers) if args.with_hidden_states else (),
+        visual_advantage=args.with_visual_advantage,
     )
 
 
@@ -412,30 +412,19 @@ def main(argv: list[str] | None = None) -> int:
     order = {eid: i for i, eid in enumerate(wanted)}
     examples.sort(key=lambda e: order[e.example_id])
 
-    kinds = ["top_k_logits"]
-    for flag, label in (
-        (args.with_hidden_states, "hidden_states"),
-        (args.with_combine_weights, "combine_weights"),
-        (args.with_visual_advantage, "visual_advantage"),
-    ):
-        if flag:
-            kinds.append(label)
-    print(f"[extract] caching {', '.join(kinds)}")
-
     model, processor = load_teacher(
         config.extraction.teacher_model, args.device_map, config.student.dtype
     )
     text_config = model.config.text_config
     n_experts = int(getattr(text_config, "num_experts", 0))
-    combine_weight_layers = tuple(
-        args.combine_weight_layers
-        if args.combine_weight_layers is not None
-        else range(len(hybrid_layers(model)))
-    )
+    spec = build_spec(args, len(hybrid_layers(model)))
 
-    metadata = build_metadata(
-        args, fingerprint, manifest, combine_weight_layers, n_experts, int(text_config.hidden_size)
+    metadata = StoreMetadata(
+        extraction_fingerprint=fingerprint,
+        vector_kinds=store_schema(spec, n_experts, int(text_config.hidden_size)),
+        corpus_manifest=manifest.model_dump(mode="json"),
     )
+    print(f"[extract] caching {sorted(metadata.vector_kinds)}")
     store = ArtifactStore.create(store_root(args.store, fingerprint), metadata)
     done = store.example_ids()
     todo = [e for e in examples if e.example_id not in done]
@@ -449,7 +438,14 @@ def main(argv: list[str] | None = None) -> int:
     for index, example in enumerate(todo, start=1):
         batch.extend(
             extract_example(
-                model, processor, example, image_store, args, combine_weight_layers, n_experts
+                model,
+                processor,
+                example,
+                image_store,
+                spec,
+                n_experts,
+                args.max_new_tokens,
+                args.skip_correctness,
             )
         )
         if len(batch) >= args.batch_size:

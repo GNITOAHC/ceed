@@ -35,7 +35,12 @@ from ceed_core.config import (
     resolve_group_config,
     run_hash,
 )
-from ceed_core.layer_mapping import LayerMapping, mismatched_mapping, proportional_mapping
+from ceed_core.layer_mapping import (
+    LayerMapping,
+    MappingKind,
+    mismatched_mapping,
+    proportional_mapping,
+)
 from ceed_core.metrics import MetricsSink, Tracker
 from ceed_core.run_record import RunRecord
 
@@ -54,6 +59,7 @@ __all__ = [
     "ExtractionConfig",
     "GroupConfig",
     "LayerMapping",
+    "MappingKind",
     "MetricsSink",
     "MissingArtifactKindError",
     "ParamEfficiencyMode",

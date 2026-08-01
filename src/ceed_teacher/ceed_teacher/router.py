@@ -59,15 +59,23 @@ def hybrid_layers(model: Any) -> list[Any]:
     return sorted(found, key=lambda layer: getattr(layer, "layer_idx", 0))
 
 
+def _layer_index(layer: Any, depth: int) -> int:
+    """Return a layer's own index in the Teacher's stack, or its depth if it has none."""
+    return int(getattr(layer, "layer_idx", depth))
+
+
 @contextmanager
 def capture_combine_weights(model: Any, n_experts: int) -> Iterator[dict[int, Tensor]]:
     """Capture every layer's effective combine weights for the next forward.
 
-    Yields a dictionary that the forward fills: layer index to a dense
-    ``[positions, experts]`` tensor in which the routed experts carry their
-    effective combine weight and every other expert carries zero. The hooks are
-    removed on exit, so the Teacher is left exactly as it was found — it is also
-    used for the ordinary logit pass.
+    Yields a dictionary that the forward fills: **teacher layer index** to a
+    dense ``[positions, experts]`` tensor in which the routed experts carry their
+    effective combine weight and every other expert carries zero. The key is the
+    layer's own ``layer_idx``, not its position among the hybrid layers — those
+    coincide for a Teacher whose every layer is hybrid, and diverge silently for
+    one whose layers are not, which is the sort of thing that reads the wrong
+    layer without ever raising. The hooks are removed on exit, so the Teacher is
+    left exactly as it was found — it is also used for the ordinary logit pass.
 
     Args:
         model: The loaded Teacher.
@@ -99,7 +107,7 @@ def capture_combine_weights(model: Any, n_experts: int) -> Iterator[dict[int, Te
         return hook
 
     for depth, layer in enumerate(hybrid_layers(model)):
-        handles.append(layer.router.register_forward_hook(hook_for(depth)))
+        handles.append(layer.router.register_forward_hook(hook_for(_layer_index(layer, depth))))
     try:
         yield captured
     finally:

@@ -164,3 +164,22 @@ def test_stacking_a_layer_that_was_never_captured_is_refused():
         model(a_forward(model))
     with pytest.raises(KeyError, match="7"):
         stack_layers(captured, (7,), position=0)
+
+
+def test_the_capture_is_keyed_by_the_layers_own_index_not_its_depth():
+    """A Teacher whose layers are not all hybrid must still key by teacher layer.
+
+    Gemma-4 makes every layer hybrid, so depth and `layer_idx` coincide and the
+    distinction is invisible — until it is not, at which point `stack_layers`
+    would read a different layer than the Group's mapping asked for and nothing
+    would raise.
+    """
+    model = FakeTeacher(n_layers=2)
+    # Stand in for a stack where the hybrid layers sit at 7 and 21.
+    model.language_model[0].layer_idx = 7
+    model.language_model[1].layer_idx = 21
+
+    with capture_combine_weights(model, N_EXPERTS) as captured:
+        model(a_forward(model))
+
+    assert sorted(captured) == [7, 21]

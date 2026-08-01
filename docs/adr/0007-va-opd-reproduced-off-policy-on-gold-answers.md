@@ -29,6 +29,8 @@ This is the deviation that most limits what B4 can claim, and it is stated in an
 
 **The divergence is the shared backbone's, not a new one.** The paper's `KL_t` is a reverse KL, which is the natural choice for on-policy distillation; ours is the backbone's forward KL over the teacher's cached top-k support. Matching the paper's direction here would have made B4 differ from B2 in *two* ways — reweighting and divergence — and the delta would no longer isolate the reweighting. B4 reweights `ceed_student.backbone.topk_kd_per_token`, the identical function B2 averages.
 
+Because every Group's step loss is `backbone + Σ signal`, and the backbone has already contributed `mean(KL)`, the signal returns the **residual** `(w_t − 1)·KL_t` rather than `w_t·KL_t`. The sum is then exactly `L_group`. Returning the reweighted loss itself would optimise `mean(KL) + mean(w·KL)`: twice B2's distillation weight, and a high-to-low token ratio of 2.15 against the paper's 4. Both variants train and both report a plausible number, so `tests/test_signals.py::test_b4s_step_loss_is_exactly_the_papers_grouped_loss` pins the identity rather than the implementation.
+
 **Uniform weights when the split is degenerate.** CEED's gold answers are frequently one or two tokens, and the paper's rollouts are long, so two cases arise that it never meets. When the high-VA group would take every token there is no low group, and when *every* advantage is zero the ranking ranks noise. Both fall back to uniform weights, so B4 reduces to B2 on those examples rather than concentrating the loss on a token chosen by tie-breaking order.
 
 ## Consequences

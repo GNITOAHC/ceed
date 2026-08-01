@@ -35,6 +35,7 @@ TOP_K_LOGIT_IDS = "top_k_logit_ids"
 TOP_K_LOGIT_VALUES = "top_k_logit_values"
 COMBINE_WEIGHTS = "combine_weights"
 HIDDEN_STATES = "hidden_states"
+VISUAL_ADVANTAGE = "visual_advantage"
 
 
 @runtime_checkable
@@ -78,41 +79,65 @@ class ExtractionSource(Protocol):
 class ExtractionSpec:
     """What to cache per answer token.
 
+    An empty layer tuple means that kind is not cached at all, which is how a
+    store built for the logit-KD Groups alone differs from one built for the
+    whole baseline set.
+
     Attributes:
         top_k: How many top logits to cache for logit KD.
         combine_weight_layers: The layers to cache effective combine weights at —
             all teacher layers, so the three-layer choice never forces a
-            re-extraction.
+            re-extraction. Empty to cache none.
         hidden_state_layers: The candidate layers to cache hidden states at.
+            Empty to cache none.
+        visual_advantage: Whether to cache B4's per-token visual advantage.
     """
 
     top_k: int
-    combine_weight_layers: tuple[int, ...]
-    hidden_state_layers: tuple[int, ...]
+    combine_weight_layers: tuple[int, ...] = ()
+    hidden_state_layers: tuple[int, ...] = ()
+    visual_advantage: bool = False
 
 
 def store_schema(spec: ExtractionSpec, n_experts: int, hidden_size: int) -> dict[str, VectorSpec]:
     """Return the store's vector-column schema for a spec and model dimensions.
 
+    This is the single definition of what a CEED store's columns are — the
+    synthetic-teacher path and the real extraction script both derive their
+    metadata from it, so the two cannot drift into disagreeing about a shape.
+
     The two layer-stacked kinds record *which* layers their leading axis holds.
     Over-caching (ADR-0001) means that is deliberately wider than the layer set a
     Group supervises, so a reader that assumed the extraction configuration's
     three layers would silently read the wrong ones.
+
+    Args:
+        spec: What the extraction caches per answer token.
+        n_experts: The Teacher's experts per layer.
+        hidden_size: The Teacher's residual width.
+
+    Returns:
+        The vector columns, omitting any kind the spec does not cache.
     """
-    return {
+    schema = {
         TOP_K_LOGIT_IDS: VectorSpec(dtype="int32", shape=(spec.top_k,)),
         TOP_K_LOGIT_VALUES: VectorSpec(dtype="float32", shape=(spec.top_k,)),
-        COMBINE_WEIGHTS: VectorSpec(
+    }
+    if spec.combine_weight_layers:
+        schema[COMBINE_WEIGHTS] = VectorSpec(
             dtype="float16",
             shape=(len(spec.combine_weight_layers), n_experts),
             layers=spec.combine_weight_layers,
-        ),
-        HIDDEN_STATES: VectorSpec(
+        )
+    if spec.hidden_state_layers:
+        schema[HIDDEN_STATES] = VectorSpec(
             dtype="float16",
             shape=(len(spec.hidden_state_layers), hidden_size),
             layers=spec.hidden_state_layers,
-        ),
-    }
+        )
+    if spec.visual_advantage:
+        schema[VISUAL_ADVANTAGE] = VectorSpec(dtype="float32", shape=(1,))
+    return schema
 
 
 def create_store(

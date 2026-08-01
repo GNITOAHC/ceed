@@ -16,35 +16,42 @@ pair survives.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from enum import StrEnum
 
-MAPPING_KINDS = ("proportional", "probe", "mismatched")
+from pydantic import BaseModel, ConfigDict, model_validator
+
+
+class MappingKind(StrEnum):
+    """How a layer mapping was produced.
+
+    A closed set rather than a string, because the three are not interchangeable:
+    ``MISMATCHED`` is C2's control and a Group silently mislabelled as one of the
+    others would make the control claim unfalsifiable.
+    """
+
+    PROPORTIONAL = "proportional"
+    """The placeholder that unblocks B3: the same relative depth in both stacks."""
+
+    PROBE = "probe"
+    """The learned replacement the layer-mapping study produces."""
+
+    MISMATCHED = "mismatched"
+    """C2's control: the same layers, deliberately paired wrongly."""
 
 
 class LayerMapping(BaseModel):
     """The correspondence between Teacher and Student layers.
 
     Attributes:
-        kind: How the mapping was produced — ``proportional`` (the placeholder
-            that unblocks B3), ``probe`` (the learned replacement), or
-            ``mismatched`` (C2's control).
+        kind: How the mapping was produced.
         pairs: The ``(teacher_layer, student_layer)`` correspondences, in
             declaration order.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    kind: str
+    kind: MappingKind
     pairs: tuple[tuple[int, int], ...]
-
-    @field_validator("kind")
-    @classmethod
-    def _known_kind(cls, value: str) -> str:
-        if value not in MAPPING_KINDS:
-            raise ValueError(
-                f"layer mapping kind must be one of {sorted(MAPPING_KINDS)}, got {value!r}"
-            )
-        return value
 
     @model_validator(mode="after")
     def _well_formed(self) -> LayerMapping:
@@ -124,7 +131,7 @@ def proportional_mapping(
         (layer, min(layer * n_student_layers // n_teacher_layers, n_student_layers - 1))
         for layer in teacher_layers
     )
-    return LayerMapping(kind="proportional", pairs=pairs)
+    return LayerMapping(kind=MappingKind.PROPORTIONAL, pairs=pairs)
 
 
 def mismatched_mapping(source: LayerMapping) -> LayerMapping:
@@ -162,4 +169,4 @@ def mismatched_mapping(source: LayerMapping) -> LayerMapping:
             f"rotating {source.pairs} leaves teacher layer(s) {unchanged} mapped to the "
             "same student layer, so the result would not be a control"
         )
-    return LayerMapping(kind="mismatched", pairs=pairs)
+    return LayerMapping(kind=MappingKind.MISMATCHED, pairs=pairs)

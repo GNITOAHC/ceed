@@ -29,6 +29,14 @@ The extraction is the long pole and is the one thing that cannot be skipped: `--
 
 **B3's auxiliary head is ten times its adapter.** The projections are 21.6M parameters against a rank-4 adapter's 2.3M (B5's probes are 1.0M). A B3 null under LoRA is therefore even harder to attribute than ADR-0005 already warns; noted in `configs/groups/b3.yaml` and the running guide.
 
+## Fixed in review
+
+**B4 double-counted the distillation term.** The signal returned `w·KL` while the backbone had already contributed `mean(KL)`, so B4 optimised `mean(KL) + mean(w·KL)` — twice B2's distillation weight, with the paper's 4:1 high-to-low token ratio flattened to 2.15:1. It now returns the residual `(w − 1)·KL`, so the step loss is exactly VA-OPD's `L_group`, B4's backbone configuration stays identical to B2's, and B4 reduces to B2 exactly where the weights come back uniform. Pinned by `test_b4s_step_loss_is_exactly_the_papers_grouped_loss`.
+
+**A new config field silently changed every trained Group's identity.** `TrainingConfig.coupling_threshold` was added for a gate no baseline uses; because the run hash covers the whole configuration, it changed B0, B1 and B2's hashes — including the B2 hash published in the provenance of the merged checkpoint. Removed (the gate keeps its own default), and `test_a_trained_baselines_run_hash_does_not_drift` now pins all three hashes so this cannot recur.
+
+Also from review: the store schema had two definitions that had already diverged (the script's knew `visual_advantage`, `ceed_teacher`'s did not) — now one, `store_schema`, which both derive from; the router capture keyed by depth rather than by the layer's own index; `gold_logprobs` annotated an id tensor as `Float`; `build_signals` carried an if/elif cascade duplicating the registry it sat beside; and a parameter used `head`, which CONTEXT.md lists as a term to avoid for a probe.
+
 ## Follow-on
 
 - The checked-in `layer_mapping` in `base.yaml` maps `(29, 39)`; the proportional rule derives `(29, 40)`. The pairs are data and are recorded on every run record, so the mapping a run used is checkable either way — but the two disagree. Left alone deliberately: changing `base.yaml` changes **every** config hash, including those of the already-trained B1 and B2 checkpoints and the published merged B2 model. The spec has B3 re-run under the probe-based mapping anyway, which is the natural moment to fix it.
