@@ -14,7 +14,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from ceed_core.config import DecodingConfig, LayerMapping, ParamEfficiencyMode
+from ceed_core.config import DecodingConfig, ParamEfficiencyMode
+from ceed_core.layer_mapping import LayerMapping
 
 RUN_RECORD_FILENAME = "run_record.json"
 

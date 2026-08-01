@@ -228,3 +228,98 @@ def test_the_placeholder_topk_contributes_nothing_to_the_backbone(image_store):
         kd_weight=0.0,
     )
     assert torch.isclose(loss.total, loss.cross_entropy)
+
+
+# -- auxiliary artefacts, read by the same ordinal key -----------------------
+
+
+def a_signal_store(tmp_path, example_id="docvqa:q1", n_tokens=2) -> ArtifactStore:
+    """A store also holding the per-token artefacts B3, B4 and B5 read.
+
+    Each token's values are distinct and derived from its ordinal, so a read that
+    returned the wrong token's artefacts is visible in the assertion rather than
+    plausible.
+    """
+    metadata = StoreMetadata(
+        extraction_fingerprint="fp-aux",
+        vector_kinds={
+            TOP_K_LOGIT_IDS: VectorSpec(dtype="int32", shape=(TOP_K,)),
+            TOP_K_LOGIT_VALUES: VectorSpec(dtype="float32", shape=(TOP_K,)),
+            "hidden_states": VectorSpec(dtype="float16", shape=(2, 3), layers=(9, 19)),
+            "visual_advantage": VectorSpec(dtype="float32", shape=(1,)),
+        },
+    )
+    store = ArtifactStore.create(store_root(tmp_path / "store", "fp-aux"), metadata)
+    rows = [
+        ArtifactRow(
+            example_id=example_id,
+            answer_token_index=ordinal,
+            gold_token_id=0,
+            correct=True,
+            vectors={
+                TOP_K_LOGIT_IDS: np.array([ordinal, ordinal + 1, ordinal + 2], np.int32),
+                TOP_K_LOGIT_VALUES: np.array([3.0, 2.0, 1.0], np.float32),
+                "hidden_states": np.full((2, 3), ordinal, np.float16),
+                "visual_advantage": np.array([ordinal * 0.5], np.float32),
+            },
+        )
+        for ordinal in range(n_tokens)
+    ]
+    store.writer("w0").write(rows)
+    return store
+
+
+def test_auxiliary_artefacts_are_stacked_in_answer_token_order(tmp_path, image_store):
+    store = a_signal_store(tmp_path)
+    batches = build_batches(
+        FakeProcessor(),
+        [an_example(answer="ab")],
+        image_store,
+        store,
+        kd_weight=1.0,
+        artefact_kinds=["hidden_states", "visual_advantage"],
+    )
+    hidden = batches[0].artefacts["hidden_states"]
+    advantage = batches[0].artefacts["visual_advantage"]
+
+    # One row per answer token, in ordinal order, with the store's own shapes.
+    assert hidden.shape == (2, 2, 3)
+    assert torch.equal(advantage.reshape(-1), torch.tensor([0.0, 0.5]))
+    assert torch.equal(hidden[0], torch.zeros(2, 3))
+    assert torch.equal(hidden[1], torch.ones(2, 3))
+
+
+def test_half_precision_artefacts_are_widened_before_they_reach_a_loss(tmp_path, image_store):
+    # The store holds hidden states in float16 to fit on disk; a loss computed
+    # against a half-precision target would cap the precision of the comparison.
+    store = a_signal_store(tmp_path)
+    batches = build_batches(
+        FakeProcessor(),
+        [an_example(answer="ab")],
+        image_store,
+        store,
+        kd_weight=1.0,
+        artefact_kinds=["hidden_states"],
+    )
+    assert batches[0].artefacts["hidden_states"].dtype is torch.float32
+
+
+def test_a_group_needing_artefacts_without_a_store_is_refused(image_store):
+    # The same fail-fast as a distilling Group with no store: better here than
+    # at the first training step.
+    with pytest.raises(ValueError, match="hidden_states"):
+        build_batches(
+            FakeProcessor(),
+            [an_example()],
+            image_store,
+            None,
+            kd_weight=0.0,
+            artefact_kinds=["hidden_states"],
+        )
+
+
+def test_a_backbone_only_group_carries_no_artefacts(tmp_path, image_store):
+    batches = build_batches(
+        FakeProcessor(), [an_example()], image_store, a_teacher_store(tmp_path), kd_weight=1.0
+    )
+    assert batches[0].artefacts == {}

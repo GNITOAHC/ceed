@@ -112,6 +112,10 @@ def run_group(
             }
             if training.lora_rank is not None:
                 metrics["train.lora_rank"] = float(training.lora_rank)
+            # The auxiliary signal is the single independent variable of the whole
+            # comparison, so each one's contribution is recorded by name.
+            for name, value in training.auxiliary_metrics.items():
+                metrics[f"train.aux.{name}"] = value
             sink.log(
                 {
                     "event": "run_group.trained",
@@ -124,6 +128,8 @@ def run_group(
                     "checkpoint_dir": checkpoint_dir,
                     "trainable_parameters": training.trainable_parameters,
                     "total_parameters": training.total_parameters,
+                    "signal_names": list(training.signal_names),
+                    "probe_parameters": training.probe_parameters,
                 }
             )
 

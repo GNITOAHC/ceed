@@ -14,6 +14,9 @@ Which pieces are built depends on the Group, not on the flags:
   and needs no artifact store.
 * **B2** declares training with ``kd_weight: 1``, so it reads the Teacher's cached
   top-k logits from the store and refuses to start if they are absent.
+* **B3, B4 and B5** each declare one auxiliary signal on top of B2's objective,
+  so each additionally reads the artefact kind its signal names — and refuses to
+  start if the store never cached it.
 
 Examples:
     # zero-shot baseline on 50 held-out examples per dataset
@@ -22,8 +25,11 @@ Examples:
     # supervised fine-tuning, no teacher
     uv run python scripts/run_group.py --group b1 --steps 200 --limit 50
 
-    # the primary baseline: needs scripts/extract_teacher_logits.py to have run
+    # the primary baseline: needs scripts/extract_teacher_artifacts.py to have run
     uv run python scripts/run_group.py --group b2 --steps 200 --limit 50
+
+    # a Group with an auxiliary signal: needs that extraction to have run --all
+    uv run python scripts/run_group.py --group b5 --steps 200 --limit 50
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from ceed_core.config import load_overlay, merge_overlays
+from ceed_student.signals import build_signals, signal_artefact_kinds
 
 from ceed_core import ArtifactStore, GroupConfig, extraction_fingerprint, store_root
 from ceed_data import ImageStore
@@ -88,15 +95,23 @@ def resolve_config(args: argparse.Namespace) -> GroupConfig:
 
 
 def open_store(args: argparse.Namespace, config: GroupConfig) -> ArtifactStore | None:
-    """Open the artifact store for this Group's fingerprint, if the Group distils."""
-    if config.training is None or config.training.backbone.kd_weight == 0.0:
+    """Open the artifact store for this Group's fingerprint, if the Group needs one.
+
+    A Group needs the store if it distils (``kd_weight`` non-zero) or if any of
+    its auxiliary signals reads a cached artefact — which all of B3, B4 and B5
+    do.
+    """
+    needs_teacher = config.training is not None and config.training.backbone.kd_weight != 0.0
+    if not needs_teacher and not config.auxiliary_signals:
         return None
     root = store_root(args.store, extraction_fingerprint(config))
     if not (root / "store_metadata.json").exists():
+        extra = " --all" if config.auxiliary_signals else ""
         raise SystemExit(
-            f"Group {config.group_code} distils from the Teacher but no artifact store "
-            f"exists at {root}.\nRun: uv run python scripts/extract_teacher_logits.py "
-            f"--corpus {args.corpus} --store {args.store} --group {args.group}"
+            f"Group {config.group_code} reads the Teacher's cached artefacts but no "
+            f"artifact store exists at {root}.\n"
+            f"Run: uv run python scripts/extract_teacher_artifacts.py "
+            f"--corpus {args.corpus} --store {args.store} --group {args.group}{extra}"
         )
     return ArtifactStore(root)
 
@@ -146,6 +161,16 @@ def main(argv: list[str] | None = None) -> int:
             model, _ = load_model(cfg)
             return CeedStudent(model)
 
+        # The signals are built before anything expensive happens, so a Group
+        # whose artefacts were never extracted fails here rather than at hour six.
+        def make_signals(cfg: GroupConfig) -> Any:
+            model, _ = load_model(cfg)
+            return build_signals(cfg, store, int(model.config.text_config.hidden_size))
+
+        signal_kinds = signal_artefact_kinds(config)
+        if signal_kinds:
+            print(f"[run] auxiliary signals read {signal_kinds} from {store.root}")
+
         def build_training_batches(cfg: GroupConfig) -> Any:
             _, processor = load_model(cfg)
             assert cfg.training is not None
@@ -156,11 +181,13 @@ def main(argv: list[str] | None = None) -> int:
                 image_store,
                 store,
                 kd_weight=cfg.training.backbone.kd_weight,
+                artefact_kinds=signal_kinds,
             )
 
         trainer = AccelerateTrainer(
             build_student=build_student,
             build_batches=build_training_batches,
+            build_signals=make_signals,
             output_root=args.output / "checkpoints" / config.group_code.lower(),
         )
 

@@ -35,6 +35,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ceed_core.layer_mapping import LayerMapping
+
 
 class ParamEfficiencyMode(StrEnum):
     """How a Group's Student parameters are trained.
@@ -58,33 +60,6 @@ class _Frozen(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class LayerMapping(_Frozen):
-    """The correspondence between Teacher and Student layers.
-
-    Represented as a first-class object rather than an implicit convention
-    because C2 is defined as a deliberately *mismatched* mapping and Phase 2
-    reports variance across alternatives, so the mapping a run used must be
-    recorded, not inferred.
-
-    Attributes:
-        kind: How the mapping was produced — ``proportional`` (the placeholder
-            that unblocks B3), ``probe`` (the learned replacement), or
-            ``mismatched`` (C2's control).
-        pairs: The ``(teacher_layer, student_layer)`` correspondences.
-    """
-
-    kind: str
-    pairs: tuple[tuple[int, int], ...]
-
-    @field_validator("kind")
-    @classmethod
-    def _known_kind(cls, value: str) -> str:
-        allowed = {"proportional", "probe", "mismatched"}
-        if value not in allowed:
-            raise ValueError(f"layer mapping kind must be one of {sorted(allowed)}, got {value!r}")
-        return value
 
 
 class StudentConfig(_Frozen):
@@ -200,6 +175,10 @@ class TrainingConfig(_Frozen):
             only at the end. Resumption reads the most recent checkpoint.
         backbone: The shared backbone objective's weighting.
         warmup: The auxiliary-signal warm-up schedule.
+        coupling_threshold: The teacher-measured coupling strength an answer
+            token must exceed for an auxiliary signal to supervise it, so that
+            supervision concentrates where the teacher shows evidence-computation
+            coupling. Inert for a Group whose extraction cached no coupling.
     """
 
     steps: int = Field(gt=0)
@@ -208,23 +187,47 @@ class TrainingConfig(_Frozen):
     checkpoint_every: int = Field(default=0, ge=0)
     backbone: BackboneConfig = BackboneConfig()
     warmup: WarmupConfig = WarmupConfig()
+    coupling_threshold: float = 0.0
+
+
+class SignalOptions(_Frozen):
+    """The tunable constants of the auxiliary signals that have any.
+
+    Typed rather than a free-form mapping, so a mistyped option is a load-time
+    error and every value that moves a reported number is part of the run hash.
+    Each field is read by exactly one signal and ignored by the rest; the
+    defaults reproduce the published settings of the method being reproduced.
+
+    Attributes:
+        va_top_fraction: B4 only. The fraction of answer tokens, ranked by
+            visual advantage, forming the high-VA group (VA-OPD's ``p_v``,
+            published default 0.2).
+        va_high_weight: B4 only. The share of the loss the high-VA group carries
+            (VA-OPD's ``lambda``, published default 0.5).
+    """
+
+    va_top_fraction: float = Field(default=0.2, gt=0.0, le=1.0)
+    va_high_weight: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class AuxiliarySignalConfig(_Frozen):
     """One auxiliary supervision signal added on top of the shared backbone.
 
     A Group is the backbone plus zero or more of these; the null Group and B0
-    have none, E4 has three. Later tickets give each signal its artefact-kind
-    requirements and loss; here it only needs a stable name and weight so that
-    Group composition and hashing can be exercised.
+    have none, E4 has three. The name selects the component
+    (:func:`ceed_student.signals.build_signals` resolves it), the weight scales
+    its contribution, and the options carry whatever constants that component
+    reads.
 
     Attributes:
         name: The signal identifier.
         weight: Its scalar loss weight.
+        options: The signal's tunable constants, defaulted per signal.
     """
 
     name: str
     weight: float = 1.0
+    options: SignalOptions = SignalOptions()
 
 
 class DecodingConfig(_Frozen):

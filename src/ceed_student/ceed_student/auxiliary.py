@@ -19,13 +19,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from jaxtyping import Float
 from torch import Tensor
 
 from ceed_core import StoreMetadata
 from ceed_student.backbone import BackboneLoss
+
+if TYPE_CHECKING:  # the loop imports this module, so the reverse edge is types-only
+    from ceed_student.training import SignalContext
 
 
 class ForwardView(StrEnum):
@@ -46,10 +49,16 @@ class ForwardView(StrEnum):
 class AuxiliarySignal(Protocol):
     """One supervision signal stacked on top of the backbone.
 
-    A signal is swappable: it declares its store and forward-view requirements
-    and produces a per-token loss, and the trainer does the rest (gating,
-    scheduling, summation). Adding a Group is adding one of these plus a YAML
-    overlay.
+    A signal is swappable: it declares what it needs — artefact kinds from the
+    store, forward views of the Student, student layers whose hidden states it
+    reads — and produces a per-token loss. The trainer does the rest: gating the
+    loss by coupling strength, scaling it by the warm-up schedule, weighting it,
+    and summing. Adding a Group is adding one of these plus a YAML overlay.
+
+    A signal that carries parameters (a projection or a probe) is additionally a
+    ``torch.nn.Module``; the trainer optimises whatever parameters it exposes and
+    keeps them out of the deployed Student, so a probe is deletable and the
+    zero-added-inference-cost claim stays literally true.
     """
 
     name: str
@@ -62,6 +71,26 @@ class AuxiliarySignal(Protocol):
     def required_views(self) -> frozenset[ForwardView]:
         """Return the forward views this signal needs the Student run under."""
         ...
+
+    def required_student_layers(self) -> frozenset[int]:
+        """Return the student layers whose hidden states this signal reads."""
+        ...
+
+    def token_loss(self, context: SignalContext) -> Float[Tensor, " tokens"]:
+        """Return this signal's loss at each answer token of the step's batch."""
+        ...
+
+
+def required_student_layers(signals: Sequence[AuxiliarySignal]) -> frozenset[int]:
+    """Return every student layer whose hidden state some signal reads.
+
+    Empty for a backbone-only Group, which is what lets the Student skip
+    computing hidden states entirely for B1 and B2.
+    """
+    layers: frozenset[int] = frozenset()
+    for signal in signals:
+        layers |= signal.required_student_layers()
+    return layers
 
 
 @dataclass(frozen=True)
@@ -162,6 +191,40 @@ def coupling_gate(
     """
     keep = coupling_strength > threshold
     return token_loss * keep
+
+
+def aux_terms(
+    signals: Sequence[AuxiliarySignal],
+    context: SignalContext,
+    coupling_threshold: float = 0.0,
+) -> list[AuxTerm]:
+    """Realise every signal's contribution for one step, gated per token.
+
+    Each signal's per-token loss is gated by the teacher-measured coupling
+    strength when the batch carries one — supervision concentrates where the
+    teacher shows evidence-computation coupling — and then reduced to the scalar
+    the step loss sums. A batch with no coupling artefact is left ungated rather
+    than silently zeroed: the Groups whose signals need coupling are the ones
+    whose extraction provides it, and zeroing an ungated Group's supervision
+    would turn a missing artefact into a quietly untrained Group.
+
+    Args:
+        signals: The Group's auxiliary signals.
+        context: The step's batch and Student forwards.
+        coupling_threshold: The coupling strength a token must exceed to
+            contribute.
+
+    Returns:
+        One term per signal, in signal order.
+    """
+    coupling = context.batch.coupling_strength
+    terms: list[AuxTerm] = []
+    for signal in signals:
+        per_token = signal.token_loss(context)
+        if coupling is not None:
+            per_token = coupling_gate(per_token, coupling, coupling_threshold)
+        terms.append(AuxTerm(name=signal.name, weight=signal.weight, value=per_token.mean()))
+    return terms
 
 
 def training_loss(

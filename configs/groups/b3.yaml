@@ -1,0 +1,38 @@
+# B3: hidden-state projection distillation. The shared backbone in full (B2's
+# objective, unchanged) plus one auxiliary signal matching the Student's residual
+# state to the Teacher's through a learned projection, at the layers base.yaml's
+# layer_mapping names.
+#
+# Answer tokens only, like every other Group (ADR-0001, plan amendment A5). That
+# deviates from textbook hidden-state KD, deliberately: full-sequence supervision
+# would give B3 ~50x the supervised positions of E1 and the B3-E1 gap would then
+# measure volume rather than signal.
+#
+# Note on capacity: the projections are 2560x2816 per mapped layer, so B3 attaches
+# ~21.6M trainable parameters against a rank-4 adapter's 2.3M. The projection can
+# therefore absorb much of the matching task itself, which makes a B3 null result
+# under LoRA even less interpretable than ADR-0005 already warns. Read B3's number
+# against B5's (~1.0M probe parameters) with that asymmetry in mind.
+group_code: B3
+corpus:
+  name: ceed-vqa
+  splits: [train]
+auxiliary_signals:
+  - name: hidden_state_projection
+    weight: 1.0
+training:
+  steps: 2000
+  learning_rate: 1.0e-4
+  batch_size: 8
+  checkpoint_every: 200
+  backbone:
+    kd_weight: 1.0 # identical to B2: only the auxiliary signal differs
+    kd_temperature: 2.0
+  warmup:
+    backbone_only_steps: 200 # the projection is untrained at step 0; let the
+    ramp_steps: 200 # backbone settle before its noise reaches the Student
+evaluation:
+  datasets: [docvqa, gqa, chartqa]
+  decoding:
+    do_sample: false # greedy, enforced in code regardless (A9)
+    max_new_tokens: 64

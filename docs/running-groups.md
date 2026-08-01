@@ -1,27 +1,36 @@
-# Running and evaluating B0, B1, and B2
+# Running and evaluating the baseline Groups, B0 to B5
 
-This is the operational guide for the three baseline Groups. Everything runs
+This is the operational guide for the six baseline Groups. Everything runs
 through `uv` from the repository root.
 
-| Group | What it is | Trains? | Needs the Teacher? |
+| Group | What it is | Trains? | Teacher artefacts it reads |
 | --- | --- | --- | --- |
-| **B0** | The Student as it ships, zero-shot | no | no |
-| **B1** | Supervised fine-tuning on gold answers (`kd_weight: 0`) | yes | no |
-| **B2** | The primary baseline: cross-entropy **+ top-k logit distillation** | yes | **yes** |
+| **B0** | The Student as it ships, zero-shot | no | none |
+| **B1** | Supervised fine-tuning on gold answers (`kd_weight: 0`) | yes | none |
+| **B2** | The primary baseline: cross-entropy **+ top-k logit distillation** | yes | `top_k_logit_*` |
+| **B3** | B2 **+ hidden-state projection distillation** | yes | `+ hidden_states` |
+| **B4** | B2 **+ VA-OPD's visual-advantage reweighting** | yes | `+ visual_advantage` |
+| **B5** | B2 **+ router combine-weight probing** | yes | `+ combine_weights` |
 
 Every experimental Group later in the plan is B2 plus one or more auxiliary
-signals, so B2 is the number they are all measured against, and B1 is the
-no-teacher control that says how much of B2's gain is distillation rather than
-fine-tuning.
+signals, so B2 is the number they are all measured against; B1 is the no-teacher
+control that says how much of B2's gain is distillation rather than fine-tuning;
+and B3 to B5 are the three published-alternative comparators.
 
-## The three scripts
+**B3, B4 and B5 differ from B2 in their auxiliary signal and in nothing else** —
+same corpus, same backbone weighting, same step budget, same decoding, same layer
+mapping. That is asserted in `tests/test_b3_b4_b5.py` rather than maintained by
+hand, because an accidental asymmetry would produce a plausible wrong number
+rather than a failure.
+
+## The scripts
 
 ```
-scripts/build_corpus.py           # once: assemble the shared corpus
-scripts/extract_teacher_logits.py # once per corpus: cache what B2 distils from
-scripts/run_group.py              # per Group: train (if it trains) and score
-scripts/infer.py                  # after a run: load the trained Student and query it
-scripts/merge_adapter.py          # optional: fold the adapter into a standalone model
+scripts/build_corpus.py              # once: assemble the shared corpus
+scripts/extract_teacher_artifacts.py # once per corpus: cache what B2-B5 read
+scripts/run_group.py                 # per Group: train (if it trains) and score
+scripts/infer.py                     # after a run: load the trained Student and query it
+scripts/merge_adapter.py             # optional: fold the adapter into a standalone model
 ```
 
 ---
@@ -64,18 +73,41 @@ data/corpus/
 If a source fails (gated repo, renamed dataset) the script warns and continues
 with the rest, so one broken source does not cost you the others.
 
-## Step 2 — Cache the Teacher's logits (only for B2)
+## Step 2 — Cache the Teacher's artefacts (for B2 and above)
 
-B2's backbone needs the Teacher's **top-k next-token logits at each gold answer
-token**. That is an ordinary teacher-forced forward pass — it needs none of the
-MoE hooking (router internals, expert ablation) the Causal Expert Attribution
-work requires, which is why the primary baseline is runnable now.
+The artifact store is the single seam between teacher measurement and student
+training: the Teacher is **never loaded during training**, so everything a Group's
+objective needs is measured once here.
 
 ```bash
-uv run python scripts/extract_teacher_logits.py \
+# B2 only: the top-k logits its backbone distils from
+uv run python scripts/extract_teacher_artifacts.py \
     --corpus data/corpus --store data/store \
     --group b2 --split train --top-k 64
+
+# everything B2 through B5 need, in one pass
+uv run python scripts/extract_teacher_artifacts.py \
+    --corpus data/corpus --store data/store-full \
+    --group b2 --split train --top-k 64 --all
 ```
+
+What `--all` adds, and what each costs:
+
+| Flag | Artefact | For | Cost |
+| --- | --- | --- | --- |
+| `--with-hidden-states` | residual state at 6 candidate layers | B3 | ~34 KB per answer token |
+| `--with-combine-weights` | effective combine weight, all 30 layers | B5 | ~8 KB per answer token |
+| `--with-visual-advantage` | per-token visual advantage | B4 | **a second forward per example** |
+
+None of this is the Causal Expert Attribution extraction, which needs the hooked
+forward that can ablate an expert and re-run the tail. Combine weights are a
+byproduct of the ordinary forward — which is exactly why B5 ships with the
+baselines and the CEA Groups do not.
+
+> **A store's schema is fixed when it is created.** Adding an artefact kind to an
+> existing store is refused, because rows already written do not have the column.
+> If you extracted for B2 and now want B3 to B5, extract into a **new** `--store`
+> directory with `--all`. The B2 store stays valid and B2 is not retrained.
 
 - The 26B Teacher is sharded across GPUs by `--device-map auto`. On the 4×V100
   box it needs all four cards.
@@ -101,7 +133,16 @@ uv run python scripts/run_group.py --group b1 --steps 2000 --limit 100
 
 # B2 — the primary baseline (needs step 2 to have run)
 uv run python scripts/run_group.py --group b2 --steps 2000 --limit 100
+
+# B3, B4, B5 — each needs the store its signal reads, so extract with --all
+uv run python scripts/run_group.py --group b3 --store data/store-full --steps 2000 --limit 100
+uv run python scripts/run_group.py --group b4 --store data/store-full --steps 2000 --limit 100
+uv run python scripts/run_group.py --group b5 --store data/store-full --steps 2000 --limit 100
 ```
+
+A Group whose signal reads an artefact the store never cached refuses to start,
+naming the missing kind — the check happens before the Student is loaded, not at
+hour six.
 
 Useful flags:
 
@@ -141,12 +182,28 @@ runs/
   <config_hash>/
     run_record.json    # the durable statement of what this run was
     metrics.jsonl      # the event stream; disk is the source of truth
-  checkpoints/<group>/checkpoint/   # accelerate state + the LoRA adapter
+  checkpoints/<group>/checkpoint/          # accelerate state + the LoRA adapter
+  checkpoints/<group>/checkpoint/probes/   # B3/B5 only: the discarded probes
 ```
 
 `run_record.json` carries the group, seed, **parameter-efficiency mode actually
 trained**, layer mapping, both config hashes, the metrics, and the checkpoint
-path.
+path. For a Group with an auxiliary signal it also carries a
+`train.aux.<signal_name>` metric, so a row in the Phase 1 table states its own
+independent variable.
+
+**Probes are deletable.** B3's projections and B5's probes are parameters of the
+*signal*, never of the Student, so nothing has to be stripped out afterwards: the
+Student a probing run leaves behind is architecturally identical to the base
+model, and the zero-added-inference-cost claim is literally true. They are written
+to `probes/` beside the checkpoint for analysis, where no server loading the
+adapter can pick them up.
+
+They are not the same size, and that matters when reading the numbers. On the real
+Student, B3's projections are **21.6M** parameters and B5's probes **1.0M**,
+against a rank-4 adapter's 2.3M in the Student itself. B3's projection can absorb
+much of its own matching task, so a B3 null under LoRA is even harder to attribute
+than ADR-0005 already warns.
 
 ---
 
@@ -360,10 +417,10 @@ uv run python scripts/run_group.py --group b2 --steps 6 ...   # steps_run: 2, re
 
 ## How the numbers are produced
 
-All three Groups are scored by the **same** evaluator (`ceed_eval.DirectEvaluator`):
+Every Group is scored by the **same** evaluator (`ceed_eval.DirectEvaluator`):
 the same held-out split, greedy decoding enforced in code (A9), and the metric
 each dataset is reported under — ANLS for DocVQA, exact match for GQA, relaxed
-accuracy for ChartQA. That identity is what makes B0/B1/B2 comparable to each
+accuracy for ChartQA. That identity is what makes B0 to B5 comparable to each
 other.
 
 Two things are deliberate and worth knowing:
@@ -400,7 +457,7 @@ real corpus:
 ```bash
 uv run python scripts/run_group.py --group b0 --corpus <corpus> --limit 3
 uv run python scripts/run_group.py --group b1 --corpus <corpus> --steps 3 --train-limit 4
-uv run python scripts/extract_teacher_logits.py --corpus <corpus> --store <store> \
+uv run python scripts/extract_teacher_artifacts.py --corpus <corpus> --store <store> \
     --group b2 --limit 4 --top-k 32 --skip-correctness
 uv run python scripts/run_group.py --group b2 --corpus <corpus> --store <store> \
     --steps 4 --train-limit 4 --limit 3
@@ -413,8 +470,22 @@ rather than restarting.
 
 ## Troubleshooting
 
-**"Group B2 distils from the Teacher but no artifact store exists at …"** — run
-step 2. The message includes the exact command.
+**"Group B2 reads the Teacher's cached artefacts but no artifact store exists at
+…"** — run step 2. The message includes the exact command, with `--all` if the
+Group needs it.
+
+**"store … is missing artefact kind(s) ['combine_weights']"** — the store was
+extracted without the kind this Group's signal reads. Re-extract into a new
+`--store` directory with `--all`; a store's schema cannot be widened in place.
+
+**"store at … already exists with different metadata"** — you asked for more
+artefact kinds than the store at that path was created with. Same fix: a new
+`--store` directory. The old store stays valid, so Groups already trained against
+it are not invalidated and are not retrained.
+
+**"teacher layer 17 was not cached; this store holds [4, 9, 14, 19, 24, 29]"** —
+`base.yaml`'s `layer_mapping` names a teacher layer the extraction did not cache.
+Either map to a cached layer or re-extract with `--hidden-state-layers`.
 
 **"no row for ('docvqa:q1', 3) in store"** — the Student encoded more answer
 tokens than the store holds for that example. The store was built from a

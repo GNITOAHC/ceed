@@ -61,3 +61,21 @@ def b1_config(configs_dir: Path) -> GroupConfig:
 def b2_config(configs_dir: Path) -> GroupConfig:
     """The resolved B2 (primary baseline: CE + logit KD) configuration."""
     return _resolve(configs_dir, "b2")
+
+
+@pytest.fixture
+def b3_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B3 (hidden-state projection distillation) configuration."""
+    return _resolve(configs_dir, "b3")
+
+
+@pytest.fixture
+def b4_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B4 (VA-OPD reproduction) configuration."""
+    return _resolve(configs_dir, "b4")
+
+
+@pytest.fixture
+def b5_config(configs_dir: Path) -> GroupConfig:
+    """The resolved B5 (router combine-weight distillation) configuration."""
+    return _resolve(configs_dir, "b5")

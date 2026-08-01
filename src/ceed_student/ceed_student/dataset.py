@@ -159,6 +159,36 @@ def teacher_topk_for(
     )
 
 
+def artefacts_for(
+    store: ArtifactStore, example_id: str, n_answer_tokens: int, kinds: Sequence[str]
+) -> dict[str, torch.Tensor]:
+    """Read one example's auxiliary artefacts, stacked in answer-token order.
+
+    These are whatever the Group's auxiliary signals declared they need — a
+    hidden state per mapped layer, a combine-weight vector, a scalar visual
+    advantage. They are read by the same ordinal key as the backbone's top-k, so
+    every artefact for a token lines up with that token's loss without any
+    alignment logic (story 24).
+
+    Args:
+        store: The artifact store to read from.
+        example_id: The example whose artefacts to read.
+        n_answer_tokens: How many answer tokens the Student encoded.
+        kinds: The artefact kinds to read.
+
+    Returns:
+        Each kind stacked as ``[answer_tokens, ...]``, keyed by kind.
+    """
+    artefacts: dict[str, torch.Tensor] = {}
+    for kind in kinds:
+        rows = [store.vector(example_id, ordinal, kind) for ordinal in range(n_answer_tokens)]
+        # float16 artefacts are read as float32: the Student's loss is computed
+        # in its own compute dtype, and half-precision targets would silently
+        # cap the precision of every comparison against them.
+        artefacts[kind] = torch.from_numpy(np.stack(rows).astype(np.float32))
+    return artefacts
+
+
 def placeholder_topk(answer_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Return an inert top-k standing in for a teacher that was never consulted.
 
@@ -178,6 +208,7 @@ def build_batches(
     image_store: ImageStore,
     store: ArtifactStore | None,
     kd_weight: float,
+    artefact_kinds: Sequence[str] = (),
     progress: Callable[[int, int], None] | None = None,
 ) -> list[TrainingBatch]:
     """Build one training batch per example, pairing it with the teacher's cache.
@@ -190,18 +221,26 @@ def build_batches(
             for a teacher-free Group (B1).
         kd_weight: The Group's distillation weight, used to refuse a teacher-free
             build for a Group that actually distils.
+        artefact_kinds: The further artefact kinds the Group's auxiliary signals
+            declared — read into each batch alongside the backbone's targets.
         progress: Optional callback invoked with ``(done, total)``.
 
     Returns:
         One :class:`~ceed_student.training.TrainingBatch` per example.
 
     Raises:
-        ValueError: If ``store`` is ``None`` while ``kd_weight`` is non-zero.
+        ValueError: If ``store`` is ``None`` while the Group needs one, either to
+            distil or to feed an auxiliary signal.
     """
     if store is None and kd_weight != 0.0:
         raise ValueError(
             "a Group with kd_weight != 0 distils from the teacher and needs an "
             "artifact store; run teacher extraction first"
+        )
+    if store is None and artefact_kinds:
+        raise ValueError(
+            f"this Group's auxiliary signals read {sorted(artefact_kinds)} from the "
+            "artifact store, but no store was supplied; run teacher extraction first"
         )
 
     batches: list[TrainingBatch] = []
@@ -213,10 +252,12 @@ def build_batches(
         # Answer token t is predicted at position t-1; the first answer token is
         # predicted at the prompt's final position.
         positions = torch.arange(prompt_length - 1, prompt_length - 1 + n_answer)
+        artefacts: dict[str, torch.Tensor] = {}
         if store is None:
             topk_ids, topk_values = placeholder_topk(answer_ids)
         else:
             topk_ids, topk_values = teacher_topk_for(store, example.example_id, n_answer)
+            artefacts = artefacts_for(store, example.example_id, n_answer, artefact_kinds)
         batches.append(
             TrainingBatch(
                 student_inputs=inputs,
@@ -224,6 +265,7 @@ def build_batches(
                 gold_token_ids=answer_ids.to(torch.long),
                 teacher_topk_ids=topk_ids,
                 teacher_topk_values=topk_values,
+                artefacts=artefacts,
             )
         )
         if progress is not None:

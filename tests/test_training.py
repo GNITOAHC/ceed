@@ -15,6 +15,7 @@ import pytest
 import torch
 from ceed_student.training import (
     AccelerateTrainer,
+    StudentForward,
     TrainableStudent,
     TrainingBatch,
     TrainingOutcome,
@@ -28,7 +29,9 @@ from ceed_student import ForwardView
 class TinyStudent(torch.nn.Module):
     """A CPU-sized Student: embed, project, read off the answer positions."""
 
-    def __init__(self, vocab: int = 8, hidden: int = 4) -> None:
+    HIDDEN = 4
+
+    def __init__(self, vocab: int = 8, hidden: int = HIDDEN) -> None:
         super().__init__()
         self.embed = torch.nn.Embedding(vocab, hidden)
         self.proj = torch.nn.Linear(hidden, vocab)
@@ -36,10 +39,17 @@ class TinyStudent(torch.nn.Module):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.proj(self.embed(input_ids))
 
-    def answer_logits(self, batch: TrainingBatch, view: ForwardView) -> torch.Tensor:
+    def answer_forward(
+        self, batch: TrainingBatch, view: ForwardView, hidden_layers: frozenset[int] = frozenset()
+    ) -> StudentForward:
         assert view is ForwardView.ORIGINAL
-        logits = self(batch.student_inputs["input_ids"])
-        return logits[batch.answer_token_positions]
+        hidden = self.embed(batch.student_inputs["input_ids"])
+        logits = self.proj(hidden)
+        positions = batch.answer_token_positions
+        return StudentForward(
+            logits=logits[positions],
+            hidden_states={layer: hidden[positions] for layer in sorted(hidden_layers)},  # noqa: C420
+        )
 
 
 def a_batch(seed: int = 0) -> TrainingBatch:

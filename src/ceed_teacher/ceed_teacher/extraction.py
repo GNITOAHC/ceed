@@ -92,15 +92,25 @@ class ExtractionSpec:
 
 
 def store_schema(spec: ExtractionSpec, n_experts: int, hidden_size: int) -> dict[str, VectorSpec]:
-    """Return the store's vector-column schema for a spec and model dimensions."""
+    """Return the store's vector-column schema for a spec and model dimensions.
+
+    The two layer-stacked kinds record *which* layers their leading axis holds.
+    Over-caching (ADR-0001) means that is deliberately wider than the layer set a
+    Group supervises, so a reader that assumed the extraction configuration's
+    three layers would silently read the wrong ones.
+    """
     return {
         TOP_K_LOGIT_IDS: VectorSpec(dtype="int32", shape=(spec.top_k,)),
         TOP_K_LOGIT_VALUES: VectorSpec(dtype="float32", shape=(spec.top_k,)),
         COMBINE_WEIGHTS: VectorSpec(
-            dtype="float16", shape=(len(spec.combine_weight_layers), n_experts)
+            dtype="float16",
+            shape=(len(spec.combine_weight_layers), n_experts),
+            layers=spec.combine_weight_layers,
         ),
         HIDDEN_STATES: VectorSpec(
-            dtype="float16", shape=(len(spec.hidden_state_layers), hidden_size)
+            dtype="float16",
+            shape=(len(spec.hidden_state_layers), hidden_size),
+            layers=spec.hidden_state_layers,
         ),
     }
 
