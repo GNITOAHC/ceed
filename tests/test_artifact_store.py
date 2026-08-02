@@ -233,3 +233,112 @@ def test_a_row_with_the_wrong_vector_shape_is_refused(tmp_path):
     )
     with pytest.raises(ArtifactStoreError, match="shape"):
         store.writer("w0").write([bad])
+
+
+# -- reading a corpus, rather than a cell at a time --------------------------
+
+
+def test_bulk_reads_return_every_kind_stacked_in_answer_token_order(tmp_path):
+    """The leading axis is the answer-token ordinal, for every kind at once.
+
+    That is the whole value of the store's key: artefacts for a token line up
+    with that token's loss without any alignment logic (story 24).
+    """
+    store = ArtifactStore.create(
+        tmp_path / "s",
+        StoreMetadata(
+            extraction_fingerprint="fp",
+            vector_kinds={
+                "top_k_logit_ids": VectorSpec(dtype="int32", shape=(2,)),
+                "hidden_states": VectorSpec(dtype="float16", shape=(2, 3), layers=(9, 19)),
+            },
+        ),
+    )
+    # Written out of order on purpose: the read must sort, not trust the shards.
+    store.writer("w0").write(
+        [
+            ArtifactRow(
+                example_id="e1",
+                answer_token_index=ordinal,
+                gold_token_id=ordinal,
+                correct=True,
+                vectors={
+                    "top_k_logit_ids": np.array([ordinal, ordinal + 1], np.int32),
+                    "hidden_states": np.full((2, 3), ordinal, np.float16),
+                },
+            )
+            for ordinal in (2, 0, 1)
+        ]
+    )
+
+    read = store.vectors_by_example(["top_k_logit_ids", "hidden_states"])
+    assert list(read) == ["e1"]
+    assert read["e1"]["top_k_logit_ids"].shape == (3, 2)
+    assert read["e1"]["hidden_states"].shape == (3, 2, 3)
+    assert [int(row[0]) for row in read["e1"]["top_k_logit_ids"]] == [0, 1, 2]
+
+
+def test_a_bulk_read_agrees_with_reading_the_same_cells_one_at_a_time(tmp_path):
+    store = ArtifactStore.create(
+        tmp_path / "s",
+        StoreMetadata(
+            extraction_fingerprint="fp",
+            vector_kinds={"v": VectorSpec(dtype="float32", shape=(2,))},
+        ),
+    )
+    store.writer("w0").write(
+        [
+            ArtifactRow(
+                example_id=f"e{example}",
+                answer_token_index=ordinal,
+                gold_token_id=0,
+                correct=True,
+                vectors={"v": np.array([example, ordinal], np.float32)},
+            )
+            for example in range(3)
+            for ordinal in range(2)
+        ]
+    )
+
+    bulk = store.vectors_by_example(["v"])
+    for example in range(3):
+        for ordinal in range(2):
+            assert np.array_equal(
+                bulk[f"e{example}"]["v"][ordinal], store.vector(f"e{example}", ordinal, "v")
+            )
+
+
+def test_a_bulk_read_can_be_restricted_to_the_examples_asked_for(tmp_path):
+    store = ArtifactStore.create(
+        tmp_path / "s",
+        StoreMetadata(
+            extraction_fingerprint="fp",
+            vector_kinds={"v": VectorSpec(dtype="float32", shape=(1,))},
+        ),
+    )
+    store.writer("w0").write(
+        [
+            ArtifactRow(
+                example_id=f"e{i}",
+                answer_token_index=0,
+                gold_token_id=0,
+                correct=True,
+                vectors={"v": np.array([i], np.float32)},
+            )
+            for i in range(4)
+        ]
+    )
+    assert sorted(store.vectors_by_example(["v"], ["e1", "e3"])) == ["e1", "e3"]
+    assert store.vectors_by_example(["v"], []) == {}
+
+
+def test_a_bulk_read_of_an_absent_kind_fails_by_name(tmp_path):
+    store = ArtifactStore.create(
+        tmp_path / "s",
+        StoreMetadata(
+            extraction_fingerprint="fp",
+            vector_kinds={"v": VectorSpec(dtype="float32", shape=(1,))},
+        ),
+    )
+    with pytest.raises(MissingArtifactKindError, match="combine_weights"):
+        store.vectors_by_example(["combine_weights"])

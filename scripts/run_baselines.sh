@@ -34,9 +34,11 @@ LOGDIR="${4:-logs}"
 
 mkdir -p "$LOGDIR"
 
-# One lane per GPU. B0 trains nothing, so it shares a lane with a Group that
-# does; the rest are one Group each.
-LANES=("b0 b1" "b2" "b3" "b4 b5")
+# One lane per GPU, in the order they should run. This is a scheduling choice
+# and nothing more — the Groups are independent, so any partition trains the
+# same six models. B0 trains nothing and B1 has no teacher to read, so both are
+# cheap and share the first lane.
+LANES=("b0 b1 b5" "b2" "b3" "b4")
 
 run_lane() {
     local gpu="$1"

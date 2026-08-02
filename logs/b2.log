@@ -1,7 +1,0 @@
-[run] group B2  seed 0  mode lora
-[run] config hash c36ed63f557446cf075a2ba3c488b64730d8a69fbd55d41ea1ee79de0e8e314e
-[run] 4282 training examples from 'train'
-[run] 565 evaluation examples from 'validation'
-[run] loading the Student for training ...
-Loading weights:   0%|          | 0/2076 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 525/2076 [00:00<00:00, 5243.88it/s]Loading weights:  51%|█████     | 1050/2076 [00:00<00:00, 1224.73it/s]Loading weights:  63%|██████▎   | 1313/2076 [00:01<00:00, 1166.12it/s]Loading weights:  72%|███████▏  | 1504/2076 [00:01<00:00, 991.55it/s] Loading weights:  79%|███████▉  | 1646/2076 [00:01<00:00, 986.66it/s]Loading weights:  85%|████████▌ | 1772/2076 [00:01<00:00, 869.06it/s]Loading weights:  90%|█████████ | 1875/2076 [00:01<00:00, 777.67it/s]Loading weights:  95%|█████████▍| 1962/2076 [00:01<00:00, 752.55it/s]Loading weights:  98%|█████████▊| 2043/2076 [00:02<00:00, 757.16it/s]Loading weights: 100%|██████████| 2076/2076 [00:02<00:00, 934.73it/s]
-[run] encoding training batches ...

@@ -359,6 +359,61 @@ class ArtifactStore:
         """
         return {row[0] for row in self._read(f"SELECT DISTINCT {EXAMPLE_ID} FROM artifacts")}
 
+    def vectors_by_example(
+        self, kinds: Sequence[str], example_ids: Iterable[str] | None = None
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """Read whole artefact kinds at once, stacked per example in token order.
+
+        :meth:`vector` answers one cell, and answering a training corpus one cell
+        at a time is the wrong shape of question: each call opens a connection and
+        scans the shard glob, so a Group reading two kinds over 21k answer tokens
+        issues 42k full scans over 1,100 files before its first optimiser step. One
+        query returns the same data.
+
+        The rows come back ordered by answer-token index, so the leading axis of
+        every returned array is the answer-token ordinal — the same key the
+        Student's loss is scored at, with no alignment logic (story 24).
+
+        Args:
+            kinds: The artefact kinds to read.
+            example_ids: The examples to read, or ``None`` for all of them.
+                Filtering here rather than afterwards keeps the decode off rows
+                that were never wanted.
+
+        Returns:
+            ``{example_id: {kind: array[answer_tokens, ...]}}``, holding only
+            examples the store actually has rows for.
+
+        Raises:
+            MissingArtifactKindError: If any kind is not in the store schema.
+        """
+        self.metadata.require_kinds(kinds)
+        wanted = list(kinds)
+        if not wanted:
+            return {}
+
+        columns = ", ".join([EXAMPLE_ID, ANSWER_TOKEN_INDEX, *wanted])
+        sql = f"SELECT {columns} FROM artifacts"
+        params: list[Any] = []
+        if example_ids is not None:
+            selected = list(example_ids)
+            if not selected:
+                return {}
+            placeholders = ", ".join("?" for _ in selected)
+            sql += f" WHERE {EXAMPLE_ID} IN ({placeholders})"
+            params = list(selected)
+        sql += f" ORDER BY {EXAMPLE_ID}, {ANSWER_TOKEN_INDEX}"
+
+        stacked: dict[str, dict[str, list[np.ndarray]]] = {}
+        for row in self._read(sql, params):
+            per_kind = stacked.setdefault(row[0], {kind: [] for kind in wanted})
+            for offset, kind in enumerate(wanted, start=2):
+                per_kind[kind].append(self.metadata.vector_kinds[kind].decode(row[offset]))
+        return {
+            example_id: {kind: np.stack(values) for kind, values in per_kind.items()}
+            for example_id, per_kind in stacked.items()
+        }
+
     def vector(self, example_id: str, answer_token_index: int, kind: str) -> np.ndarray:
         """Return one decoded vector artefact.
 

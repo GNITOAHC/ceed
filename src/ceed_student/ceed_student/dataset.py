@@ -23,7 +23,7 @@ the same convention the teacher-side extraction uses.
 from __future__ import annotations
 
 import io
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -130,14 +130,14 @@ def encode_example(
     return inputs, int(prompt_ids.shape[0]), answer_ids
 
 
-def teacher_topk_for(
-    store: ArtifactStore, example_id: str, n_answer_tokens: int
+def topk_from(
+    rows: Mapping[str, np.ndarray], example_id: str, n_answer_tokens: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read one example's cached teacher top-k logits, in answer-token order.
+    """Return one example's cached teacher top-k logits, in answer-token order.
 
     Args:
-        store: The artifact store to read from.
-        example_id: The example whose artefacts to read.
+        rows: The example's artefacts, as read in bulk from the store.
+        example_id: The example, for the error message.
         n_answer_tokens: How many answer tokens the Student encoded.
 
     Returns:
@@ -146,47 +146,41 @@ def teacher_topk_for(
     Raises:
         ValueError: If the store holds a different number of answer tokens for
             this example than the Student encoded — a tokenisation mismatch that
-            would silently misalign supervision.
+            would silently misalign every token's supervision after the first.
     """
-    ids = []
-    values = []
-    for ordinal in range(n_answer_tokens):
-        ids.append(store.vector(example_id, ordinal, TOP_K_LOGIT_IDS))
-        values.append(store.vector(example_id, ordinal, TOP_K_LOGIT_VALUES))
+    ids = rows.get(TOP_K_LOGIT_IDS)
+    if ids is None:
+        raise ValueError(
+            f"the store holds no rows for {example_id!r}; it was built from a "
+            "different corpus, or extraction has not covered this example"
+        )
+    if ids.shape[0] != n_answer_tokens:
+        raise ValueError(
+            f"the store holds {ids.shape[0]} answer tokens for {example_id!r} but the "
+            f"Student encoded {n_answer_tokens}; the two were built from different "
+            "prompts or tokenizers, and training would misalign supervision"
+        )
     return (
-        torch.from_numpy(np.stack(ids).astype(np.int64)),
-        torch.from_numpy(np.stack(values).astype(np.float32)),
+        torch.from_numpy(ids.astype(np.int64)),
+        torch.from_numpy(rows[TOP_K_LOGIT_VALUES].astype(np.float32)),
     )
 
 
-def artefacts_for(
-    store: ArtifactStore, example_id: str, n_answer_tokens: int, kinds: Sequence[str]
-) -> dict[str, torch.Tensor]:
-    """Read one example's auxiliary artefacts, stacked in answer-token order.
+def artefacts_from(rows: Mapping[str, np.ndarray], kinds: Sequence[str]) -> dict[str, torch.Tensor]:
+    """Return the auxiliary artefacts a Group's signals read, as tensors.
 
-    These are whatever the Group's auxiliary signals declared they need — a
-    hidden state per mapped layer, a combine-weight vector, a scalar visual
-    advantage. They are read by the same ordinal key as the backbone's top-k, so
-    every artefact for a token lines up with that token's loss without any
-    alignment logic (story 24).
+    Half-precision artefacts are widened to float32: the loss is computed in the
+    Student's compute dtype, and a half-precision target would cap the precision
+    of every comparison against it.
 
     Args:
-        store: The artifact store to read from.
-        example_id: The example whose artefacts to read.
-        n_answer_tokens: How many answer tokens the Student encoded.
-        kinds: The artefact kinds to read.
+        rows: The example's artefacts, as read in bulk from the store.
+        kinds: The artefact kinds the Group's signals declared.
 
     Returns:
-        Each kind stacked as ``[answer_tokens, ...]``, keyed by kind.
+        Each kind as ``[answer_tokens, ...]``, keyed by kind.
     """
-    artefacts: dict[str, torch.Tensor] = {}
-    for kind in kinds:
-        rows = [store.vector(example_id, ordinal, kind) for ordinal in range(n_answer_tokens)]
-        # float16 artefacts are read as float32: the Student's loss is computed
-        # in its own compute dtype, and half-precision targets would silently
-        # cap the precision of every comparison against them.
-        artefacts[kind] = torch.from_numpy(np.stack(rows).astype(np.float32))
-    return artefacts
+    return {kind: torch.from_numpy(rows[kind].astype(np.float32)) for kind in kinds}
 
 
 def placeholder_topk(answer_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -243,6 +237,14 @@ def build_batches(
             "artifact store, but no store was supplied; run teacher extraction first"
         )
 
+    # Every cached row this Group needs, in one query. Read a cell at a time and
+    # each call scans the whole shard glob, so a corpus-sized dataloader spends
+    # longer assembling batches than training on them.
+    cached: dict[str, dict[str, np.ndarray]] = {}
+    if store is not None:
+        wanted = [TOP_K_LOGIT_IDS, TOP_K_LOGIT_VALUES, *artefact_kinds]
+        cached = store.vectors_by_example(wanted, [e.example_id for e in examples])
+
     batches: list[TrainingBatch] = []
     for index, example in enumerate(examples):
         inputs, prompt_length, answer_ids = encode_example(processor, example, image_store)
@@ -256,8 +258,9 @@ def build_batches(
         if store is None:
             topk_ids, topk_values = placeholder_topk(answer_ids)
         else:
-            topk_ids, topk_values = teacher_topk_for(store, example.example_id, n_answer)
-            artefacts = artefacts_for(store, example.example_id, n_answer, artefact_kinds)
+            rows = cached.get(example.example_id, {})
+            topk_ids, topk_values = topk_from(rows, example.example_id, n_answer)
+            artefacts = artefacts_from(rows, artefact_kinds)
         batches.append(
             TrainingBatch(
                 student_inputs=inputs,

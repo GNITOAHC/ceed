@@ -206,9 +206,26 @@ def test_a_store_missing_an_answer_token_fails_rather_than_misaligning(tmp_path,
     # The store holds two tokens but the Student encodes three: a tokenisation
     # disagreement that must surface, since misaligned supervision is silent.
     store = a_teacher_store(tmp_path, n_tokens=2)
-    with pytest.raises(Exception, match="no row"):
+    with pytest.raises(ValueError, match=r"2 answer tokens .* Student encoded 3"):
         build_batches(
             FakeProcessor(), [an_example(answer="abc")], image_store, store, kd_weight=1.0
+        )
+
+
+def test_an_example_the_store_never_covered_fails_rather_than_training_on_nothing(
+    tmp_path, image_store
+):
+    # A corpus example with no rows at all: the store was built from a different
+    # corpus, or extraction did not finish. Either way the Group must not quietly
+    # train on the examples that happen to be present.
+    store = a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=2)
+    with pytest.raises(ValueError, match="no rows for 'docvqa:missing'"):
+        build_batches(
+            FakeProcessor(),
+            [an_example(example_id="docvqa:missing")],
+            image_store,
+            store,
+            kd_weight=1.0,
         )
 
 
