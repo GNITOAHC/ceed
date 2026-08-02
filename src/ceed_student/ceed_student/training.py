@@ -561,7 +561,10 @@ class AccelerateTrainer:
 
                 # Scaled by the accumulation, so the summed gradient is the mean
                 # over the batch and the learning rate means the same thing at any
-                # batch size.
+                # batch size. Dividing before the backward is safe in fp16: PEFT
+                # keeps the adapter in fp32 over a half-precision base, and the
+                # probes are fp32 by construction, so the accumulation the
+                # gradients land in is full precision either way.
                 accelerator.backward(loss / training.batch_size)
 
                 totals["loss"] += float(loss.detach()) / training.batch_size
