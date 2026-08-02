@@ -33,6 +33,18 @@ Because every Group's step loss is `backbone + Σ signal`, and the backbone has 
 
 **Uniform weights when the split is degenerate.** CEED's gold answers are frequently one or two tokens, and the paper's rollouts are long, so two cases arise that it never meets. When the high-VA group would take every token there is no low group, and when *every* advantage is zero the ranking ranks noise. Both fall back to uniform weights, so B4 reduces to B2 on those examples rather than concentrating the loss on a token chosen by tie-breaking order.
 
+**`p_v` is effectively larger here than the paper's 0.2, and cannot not be.** The high-VA group takes `max(1, floor(T * p_v))` tokens, and DocVQA answers are short — median 4 tokens, mean 5.0 — so the floor bites constantly: a 4-token answer gives `floor(0.8) = 0`, rounded up to one token, which is 25% and not 20%. Measured over the 4,282-example training split the **effective `p_v` averages 0.346** (median 0.250), and 11.3% of examples are a single token, where the split degenerates to uniform entirely. This is not a tunable: lowering the nominal `p_v` cannot lower the effective one below `1/T`. It means B4's concentration is milder than VA-OPD's by construction, which weakens B4 as a comparator in CEED's favour and must be stated wherever B4 is reported.
+
+## The premise, measured on this corpus
+
+Reproducing the method is worth little if its premise does not hold on the data it is being run against, so it was checked over the whole 4,282-example training split (21,201 answer tokens) before B4 was trained:
+
+- **12.9%** of answer tokens have exactly zero visual advantage — the teacher predicted them at least as well without the detail.
+- The distribution is sharply right-skewed: median **0.271** nats against a mean of **3.208** and a 90th percentile of **10.8**.
+- On multi-token answers carrying any advantage at all, the single highest-VA token holds **69.9%** of that example's total.
+
+That is VA-OPD's central observation — "VA is concentrated in a small minority of tokens" — holding on DocVQA under this teacher. B4 is therefore a fair reproduction on this corpus rather than a method applied where its premise fails.
+
 ## Consequences
 
 - B4's numbers are a reproduction of VA-OPD's *signal* inside CEED's training frame, not a reproduction of the paper's results, and must be reported that way. A B4-versus-published-VA-OPD comparison is not available and is not claimed.

@@ -1,0 +1,10 @@
+[run] group B0  seed 0  mode full
+[run] config hash c185f0520f4623cfe57de5426a188a24fd2a0cba56b0548caa716935d23979f8
+[run] 565 evaluation examples from 'validation'
+[run] loading the Student for evaluation ...
+Loading weights:   0%|          | 0/2076 [00:00<?, ?it/s]Loading weights:  21%|██        | 429/2076 [00:00<00:00, 4279.56it/s]Loading weights:  41%|████▏     | 857/2076 [00:00<00:01, 1019.25it/s]Loading weights:  55%|█████▍    | 1132/2076 [00:00<00:00, 1302.78it/s]Loading weights:  66%|██████▌   | 1372/2076 [00:01<00:00, 1200.19it/s]Loading weights:  83%|████████▎ | 1733/2076 [00:01<00:00, 1629.91it/s]Loading weights: 100%|██████████| 2076/2076 [00:01<00:00, 1664.05it/s]
+[eval] 25/565
+[eval] 50/565
+[eval] 75/565
+[eval] 100/565
+[eval] 125/565
