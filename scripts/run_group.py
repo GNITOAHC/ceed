@@ -116,26 +116,59 @@ def open_store(args: argparse.Namespace, config: GroupConfig) -> ArtifactStore |
     return ArtifactStore(root)
 
 
-def make_model_loader(args: argparse.Namespace):
-    """Return a loader that builds the Student and processor for a Group, once."""
-    cache: dict[str, tuple[Any, Any]] = {}
+class StudentLoader:
+    """Loads the Student once and hands the same one back, until released.
 
-    def load(config: GroupConfig) -> tuple[Any, Any]:
-        if "model" not in cache:
+    Training and evaluation must **not** share a Student, and the reason is not
+    tidiness. ``get_peft_model`` injects the LoRA layers into the module tree in
+    place, so after training the loaded model already carries the adapter;
+    handing that same object to the evaluator, which applies the adapter again
+    from the checkpoint, stacks a second injection on the first. Whether that
+    happens to compose or to double the adaptation, the number it produces is not
+    the number the saved checkpoint would produce for anyone else.
+
+    So the evaluator gets its own loader, and :meth:`release` frees the trained
+    one first — two 8B Students in fp16 are 32 GB and will not sit on one V100
+    together. Reloading also makes the score a statement about what is *on disk*,
+    which is what a later run, a merge, or a reader downloading the checkpoint
+    will actually get.
+    """
+
+    def __init__(self, args: argparse.Namespace, label: str) -> None:
+        """Configure a loader; nothing is loaded until it is first asked for."""
+        self.args = args
+        self.label = label
+        self._cache: tuple[Any, Any] | None = None
+
+    def __call__(self, config: GroupConfig) -> tuple[Any, Any]:
+        """Return the Student and processor, loading them on first use."""
+        if self._cache is None:
+            from ceed_core import DecodingConfig
             from ceed_student import load_student
 
             decoding = config.evaluation.decoding if config.evaluation is not None else None
-            from ceed_core import DecodingConfig
-
-            cache["model"] = load_student(
+            print(f"[run] loading the Student for {self.label} ...", flush=True)
+            self._cache = load_student(
                 config.student.model,
                 decoding or DecodingConfig(),
                 dtype=config.student.dtype,
-                device=args.device,
+                device=self.args.device,
             )
-        return cache["model"]
+        return self._cache
 
-    return load
+    def release(self) -> None:
+        """Drop the loaded Student and give its memory back to the device."""
+        if self._cache is None:
+            return
+        self._cache = None
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[run] released the Student held for {self.label}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -147,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     from ceed_student.dataset import load_corpus_split
 
     image_store = ImageStore(args.corpus / "images")
-    load_model = make_model_loader(args)
+    load_for_training = StudentLoader(args, "training")
+    load_for_evaluation = StudentLoader(args, "evaluation")
 
     trainer = None
     if config.training is not None:
@@ -158,13 +192,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[run] {len(train_examples)} training examples from '{args.train_split}'")
 
         def build_student(cfg: GroupConfig) -> Any:
-            model, _ = load_model(cfg)
+            model, _ = load_for_training(cfg)
             return CeedStudent(model)
 
         # The signals are built before anything expensive happens, so a Group
         # whose artefacts were never extracted fails here rather than at hour six.
         def make_signals(cfg: GroupConfig) -> Any:
-            model, _ = load_model(cfg)
+            model, _ = load_for_training(cfg)
             return build_signals(cfg, store, int(model.config.text_config.hidden_size))
 
         signal_kinds = signal_artefact_kinds(config)
@@ -172,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[run] auxiliary signals read {signal_kinds} from {store.root}")
 
         def build_training_batches(cfg: GroupConfig) -> Any:
-            _, processor = load_model(cfg)
+            _, processor = load_for_training(cfg)
             assert cfg.training is not None
             print("[run] encoding training batches ...", flush=True)
             return build_batches(
@@ -202,10 +236,19 @@ def main(argv: list[str] | None = None) -> int:
             if config.training is not None
             else None
         )
+
+        # The trained Student is freed before the fresh one is loaded: two 8B
+        # Students in fp16 do not fit on one card, and the point of reloading is
+        # that the score describes the checkpoint on disk rather than the mutated
+        # object training left behind.
+        def load_fresh_student(cfg: GroupConfig) -> Any:
+            load_for_training.release()
+            return load_for_evaluation(cfg)
+
         evaluator = DirectEvaluator(
             examples=eval_examples,
             image_store=image_store,
-            load_model=load_model,
+            load_model=load_fresh_student,
             checkpoint_dir=checkpoint,
             limit=args.limit,
             progress=lambda done, total: (
