@@ -34,7 +34,7 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import Tensor
 
-from ceed_core import GroupConfig, ParamEfficiencyMode
+from ceed_core import GroupConfig, ParamEfficiencyMode, run_hash
 from ceed_student.auxiliary import (
     AuxiliarySignal,
     ForwardView,
@@ -251,6 +251,34 @@ def _move_batch(batch: TrainingBatch, device: Any) -> TrainingBatch:
     )
 
 
+def resume_key(config: GroupConfig) -> str:
+    """Return the identity a checkpoint may be resumed under.
+
+    This is the run hash with the *step budget* normalised away, and it is what
+    names and guards a checkpoint directory. Everything else about a Group — its
+    objective, its signals, its batch size, its layer mapping, its seed — changes
+    what training does, so a checkpoint written under a different value of any of
+    them describes a different run and must not be adopted.
+
+    The step budget is excluded because raising it is the one change that is
+    genuinely a continuation: the example order is a pure function of the global
+    position, so running 3 steps and then 5 reaches exactly the state that running
+    5 from the start would.
+
+    Args:
+        config: The resolved Group.
+
+    Returns:
+        The hex hash identifying resumable-compatible configurations.
+    """
+    if config.training is None:
+        return run_hash(config)
+    normalised = config.model_copy(
+        update={"training": config.training.model_copy(update={"steps": 1})}
+    )
+    return run_hash(normalised)
+
+
 class ExampleSchedule:
     """Which example each micro-step of a run sees, deterministically.
 
@@ -416,12 +444,54 @@ class AccelerateTrainer:
             return None
         return json.loads(path.read_text())
 
-    def _write_progress(self, completed: int, metrics: dict[str, float], params: dict[str, int]):
+    def _write_progress(
+        self,
+        completed: int,
+        metrics: dict[str, float],
+        params: dict[str, int],
+        config: GroupConfig,
+    ) -> None:
+        """Record how far this run got, and which configuration it was."""
         checkpoint = self._checkpoint_dir()
         checkpoint.mkdir(parents=True, exist_ok=True)
         (checkpoint / PROGRESS_FILENAME).write_text(
-            json.dumps({"completed_steps": completed, **metrics, **params})
+            json.dumps(
+                {
+                    "completed_steps": completed,
+                    "config_hash": run_hash(config),
+                    "resume_key": resume_key(config),
+                    **metrics,
+                    **params,
+                }
+            )
         )
+
+    @staticmethod
+    def _check_resumable(prior: dict[str, Any], key: str, group_code: str) -> None:
+        """Refuse to resume a checkpoint some *other* configuration wrote.
+
+        Freezing and reusing a baseline's checkpoint is what stops it being
+        retrained for every later comparison, and it is exactly why a checkpoint
+        must be matched by configuration rather than by Group code. A Group whose
+        batch size, layer mapping, or objective changed is a different run; if it
+        adopted the old checkpoint it would report the previous configuration's
+        training under the new configuration's name — and, if that checkpoint were
+        already complete, would train nothing at all while appearing to succeed.
+
+        The step budget is the one field deliberately excluded (see
+        :func:`resume_key`), so raising a budget continues the same run.
+
+        Raises:
+            ValueError: If a different configuration wrote this checkpoint.
+        """
+        written_by = prior.get("resume_key")
+        if written_by is not None and written_by != key:
+            raise ValueError(
+                f"the checkpoint here was written by configuration {written_by[:12]}, "
+                f"but Group {group_code} is {key[:12]}. Resuming it would report the "
+                "older configuration's training under this one's name. Point --output "
+                "somewhere else, or delete the checkpoint to retrain."
+            )
 
     def _save_adapter(
         self, accelerator: Any, model: Any, mode: ParamEfficiencyMode
@@ -517,11 +587,13 @@ class AccelerateTrainer:
             "trainable_parameters": trainable_parameters,
         }
 
+        key = resume_key(config)
         prior = self._read_progress()
         completed = 0
         resumed = False
         restored = {"loss": 0.0, "cross_entropy": 0.0, "kd": 0.0}
         if prior is not None:
+            self._check_resumable(prior, key, config.group_code)
             accelerator.load_state(str(self._checkpoint_dir()))
             completed = int(prior["completed_steps"])
             resumed = completed > 0
@@ -586,12 +658,13 @@ class AccelerateTrainer:
                 initial_loss = last["loss"]
             if training.checkpoint_every and (step + 1) % training.checkpoint_every == 0:
                 accelerator.save_state(str(self._checkpoint_dir()))
-                self._write_progress(step + 1, last, params)
+                self._write_progress(step + 1, last, params, config)
 
-        steps_run = training.steps - completed
+        # A checkpoint past the requested budget already satisfies it.
+        steps_run = max(0, training.steps - completed)
         if steps_run > 0:
             accelerator.save_state(str(self._checkpoint_dir()))
-            self._write_progress(training.steps, last, params)
+            self._write_progress(training.steps, last, params, config)
             self._save_adapter(accelerator, model, mode)
             self._save_probes(accelerator.unwrap_model(probes))
 

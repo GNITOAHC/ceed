@@ -371,3 +371,61 @@ def test_scheduling_an_empty_corpus_is_refused():
 
     with pytest.raises(ValueError, match="empty corpus"):
         ExampleSchedule(n_examples=0, seed=0)
+
+
+# -- a checkpoint belongs to one configuration -------------------------------
+
+
+def test_a_checkpoint_written_by_another_configuration_is_refused(tmp_path):
+    """The failure this prevents trains nothing and reports a number anyway.
+
+    Checkpoints are frozen and reused so a baseline is never retrained for a
+    later comparison. Key that reuse by Group code and a Group whose objective,
+    batch size or layer mapping changed adopts the previous configuration's
+    finished checkpoint, skips training entirely because it is already "complete",
+    and reports the old run's weights under the new run's name.
+    """
+    batches = [a_batch(0), a_batch(1)]
+    a_trainer(tmp_path, batches=batches).train(_config(steps=2, batch_size=1))
+
+    changed = _config(steps=2, batch_size=2)  # a different run by any measure
+    with pytest.raises(ValueError, match="written by configuration"):
+        a_trainer(tmp_path, batches=batches).train(changed)
+
+
+def test_raising_the_step_budget_still_resumes(tmp_path):
+    # The one change that is genuinely a continuation: the example order is a
+    # pure function of the global position, so 3-then-5 reaches the state 5 from
+    # scratch would.
+    batches = [a_batch(0), a_batch(1)]
+    a_trainer(tmp_path, batches=batches).train(_config(steps=3))
+    outcome = a_trainer(tmp_path, batches=batches).train(_config(steps=5))
+    assert outcome.resumed is True
+    assert outcome.steps_run == 2
+
+
+def test_a_checkpoint_past_the_requested_budget_reports_no_negative_work(tmp_path):
+    batches = [a_batch(0), a_batch(1)]
+    a_trainer(tmp_path, batches=batches).train(_config(steps=5))
+    outcome = a_trainer(tmp_path, batches=batches).train(_config(steps=3))
+    assert outcome.steps_run == 0
+
+
+def test_the_resume_key_ignores_the_budget_and_nothing_else():
+    from ceed_student.training import resume_key
+
+    base = _config(steps=4)
+    assert resume_key(base) == resume_key(_config(steps=99))
+    assert resume_key(base) != resume_key(_config(steps=4, batch_size=2))
+    assert resume_key(base) != resume_key(_config(mode=ParamEfficiencyMode.LORA, steps=4))
+
+
+def test_the_progress_file_names_the_configuration_that_wrote_it(tmp_path):
+    import json as _json
+
+    from ceed_core import run_hash
+
+    config = _config(steps=2)
+    a_trainer(tmp_path).train(config)
+    progress = _json.loads((tmp_path / "checkpoint" / "progress.json").read_text())
+    assert progress["config_hash"] == run_hash(config)

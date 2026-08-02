@@ -40,9 +40,12 @@ The whole set, once the corpus and store exist:
 scripts/run_baselines.sh data/corpus data/store-full runs logs
 ```
 
-It is resumable in the strong sense: a Group that has reached its step budget is
-skipped rather than retrained, and a Group killed halfway continues from its last
-checkpoint. Re-running the script after a preemption is the recovery.
+One Group per GPU — the Student is 8B in fp16 and fits on a single V100 alongside
+a document-length sequence — so the six Groups run in four lanes rather than in
+sequence. It is resumable in the strong sense: a Group that has reached its step
+budget is skipped rather than retrained, and a Group killed halfway continues
+from its last checkpoint. Re-running the script after a preemption is the
+recovery.
 
 ---
 
@@ -212,8 +215,8 @@ runs/
   <config_hash>/
     run_record.json    # the durable statement of what this run was
     metrics.jsonl      # the event stream; disk is the source of truth
-  checkpoints/<group>/checkpoint/          # accelerate state + the LoRA adapter
-  checkpoints/<group>/checkpoint/probes/   # B3/B5 only: the discarded probes
+  checkpoints/<group>-<key>/checkpoint/          # accelerate state + the LoRA adapter
+  checkpoints/<group>-<key>/checkpoint/probes/   # B3/B5 only: the discarded probes
 ```
 
 `run_record.json` carries the group, seed, **parameter-efficiency mode actually
@@ -435,15 +438,37 @@ same 0.7500 mean. The merged model is a true drop-in.
 
 ## Resuming
 
-Training checkpoints and resumes; a preempted Group is restarted with the same
-command. Re-running a Group that already hit its step budget retrains nothing
-and reuses the frozen checkpoint, which is what keeps a baseline from being
-quietly retrained for a later comparison.
+Training checkpoints and resumes, so a multi-day Group survives preemption. A
+Group that has already reached its step budget is **not retrained** — its frozen
+checkpoint is reused, which is what stops a baseline being retrained for every
+later comparison.
 
 ```bash
 # ran 4 steps, then asked for 6: runs the 2 remaining
-uv run python scripts/run_group.py --group b2 --steps 6 ...   # steps_run: 2, resumed: true
+uv run python scripts/run_group.py --group b1 --steps 4
+uv run python scripts/run_group.py --group b1 --steps 6
 ```
+
+The checkpoint directory is named `<group>-<key>`, where the key is the run hash
+with the *step budget* normalised away. Everything else about a Group — its
+objective, its signals, its batch size, its layer mapping, its seed — changes what
+training does, so a Group whose configuration changed gets a different directory
+and starts fresh. Raising the budget is the one change that is genuinely a
+continuation, because the example order is a pure function of the global position.
+
+`progress.json` records the configuration that wrote it, and a checkpoint written
+by a different one is **refused** rather than adopted:
+
+```
+the checkpoint here was written by configuration 335406898cb8, but Group B1 is
+31802aeade42. Resuming it would report the older configuration's training under
+this one's name.
+```
+
+That message is worth understanding, because the failure it prevents is silent:
+a completed checkpoint from a superseded configuration would be picked up, train
+zero steps because it is already "complete", and be scored and reported as the
+new Group.
 
 ## How the numbers are produced
 

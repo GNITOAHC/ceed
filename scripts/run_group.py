@@ -41,8 +41,9 @@ from typing import Any
 
 from ceed_core.config import load_overlay, merge_overlays
 from ceed_student.signals import build_signals, signal_artefact_kinds
+from ceed_student.training import resume_key
 
-from ceed_core import ArtifactStore, GroupConfig, extraction_fingerprint, store_root
+from ceed_core import ArtifactStore, GroupConfig, extraction_fingerprint, run_hash, store_root
 from ceed_data import ImageStore
 from ceed_student import AccelerateTrainer, CeedStudent, build_batches, run_group
 
@@ -171,11 +172,23 @@ class StudentLoader:
         print(f"[run] released the Student held for {self.label}", flush=True)
 
 
+def checkpoint_root(args: argparse.Namespace, config: GroupConfig) -> Path:
+    """Return where this Group's checkpoint lives.
+
+    Keyed by the resume key and not by the Group code, because a frozen
+    checkpoint is reused rather than retrained: two runs that share a directory
+    are treated as the same run, so they had better be. The Group code is kept in
+    the name for the benefit of whoever has to read the directory listing.
+    """
+    return args.output / "checkpoints" / f"{config.group_code.lower()}-{resume_key(config)[:12]}"
+
+
 def main(argv: list[str] | None = None) -> int:
     """Resolve the Group, build its seams, run it, and report the record."""
     args = parse_args(argv)
     config = resolve_config(args)
     print(f"[run] group {config.group_code}  seed {config.seed}  mode {config.param_efficiency}")
+    print(f"[run] config hash {run_hash(config)}")
 
     from ceed_student.dataset import load_corpus_split
 
@@ -222,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             build_student=build_student,
             build_batches=build_training_batches,
             build_signals=make_signals,
-            output_root=args.output / "checkpoints" / config.group_code.lower(),
+            output_root=checkpoint_root(args, config),
         )
 
     evaluator = None
@@ -232,9 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         eval_examples = load_corpus_split(args.corpus, args.eval_split)
         print(f"[run] {len(eval_examples)} evaluation examples from '{args.eval_split}'")
         checkpoint = (
-            args.output / "checkpoints" / config.group_code.lower() / "checkpoint"
-            if config.training is not None
-            else None
+            checkpoint_root(args, config) / "checkpoint" if config.training is not None else None
         )
 
         # The trained Student is freed before the fresh one is loaded: two 8B
