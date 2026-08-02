@@ -29,9 +29,20 @@ rather than a failure.
 scripts/build_corpus.py              # once: assemble the shared corpus
 scripts/extract_teacher_artifacts.py # once per corpus: cache what B2-B5 read
 scripts/run_group.py                 # per Group: train (if it trains) and score
+scripts/run_baselines.sh             # all six Groups in order, resumable
 scripts/infer.py                     # after a run: load the trained Student and query it
 scripts/merge_adapter.py             # optional: fold the adapter into a standalone model
 ```
+
+The whole set, once the corpus and store exist:
+
+```bash
+scripts/run_baselines.sh data/corpus data/store-full runs logs
+```
+
+It is resumable in the strong sense: a Group that has reached its step budget is
+skipped rather than retrained, and a Group killed halfway continues from its last
+checkpoint. Re-running the script after a preemption is the recovery.
 
 ---
 
@@ -143,6 +154,25 @@ uv run python scripts/run_group.py --group b5 --store data/store-full --steps 20
 A Group whose signal reads an artefact the store never cached refuses to start,
 naming the missing kind — the check happens before the Student is loaded, not at
 hour six.
+
+### How much training a Group actually does
+
+`steps` is **optimiser steps**, and each one consumes `batch_size` examples by
+gradient accumulation: the Student sees one example's activations at a time (it
+is 8B, and a page is thousands of visual tokens) while the gradient is the mean
+over the batch. So the training set is walked
+
+    steps x batch_size / |train split|   times,
+
+which at the checked-in `2000 x 8` over 4,282 examples is **~3.7 epochs**. The run
+record carries `train.epochs` so this is read off the record rather than
+recomputed — and the metrics log carries `examples_seen` beside it.
+
+The corpus is **shuffled once per epoch**, deterministically from the Group's
+seed. Two Groups at the same seed therefore walk it in the same order, which is
+what keeps their difference the auxiliary signal rather than the shuffle; and the
+order is a pure function of the global position, so a preempted run resumes the
+same walk instead of restarting the epoch.
 
 Useful flags:
 

@@ -37,7 +37,18 @@ The extraction is the long pole and is the one thing that cannot be skipped: `--
 
 Also from review: the store schema had two definitions that had already diverged (the script's knew `visual_advantage`, `ceed_teacher`'s did not) — now one, `store_schema`, which both derive from; the router capture keyed by depth rather than by the layer's own index; `gold_logprobs` annotated an id tensor as `Float`; `build_signals` carried an if/elif cascade duplicating the registry it sat beside; and a parameter used `head`, which CONTEXT.md lists as a term to avoid for a probe.
 
+## Configuration decisions taken (2026-08-03)
+
+Both of the follow-ons this ticket first deferred were taken rather than carried, on the researcher's instruction that re-runs are affordable and correctness comes first. Each changes what a run *means*, so every baseline hash was rolled deliberately and the whole set B0–B5 was retrained.
+
+**`base.yaml`'s layer mapping is now the rule it claims to be.** It declared `kind: proportional` with `(29, 39)`, which no proportional rule produces — `floor(29 * 42 / 30)` is 40. A mapping labelled by a rule it does not follow is precisely the implicit convention this ticket made first-class, so the config is now derived from `proportional_mapping` and `test_the_checked_in_base_mapping_is_the_rule_it_claims_to_be` asserts the two agree rather than merely parsing the pairs.
+
+**`batch_size` is honoured, by gradient accumulation.** The loop took one example per step and ignored the setting, so `2000 steps x batch_size 8` saw 2,000 examples — under half an epoch of the 4,282-example split. It now accumulates: one example's activation memory (the Student is 8B and a page is thousands of visual tokens), a gradient that is the mean over the batch, and a learning rate that means the same thing at any batch size. `2000 x 8` is 16,000 examples, **~3.7 epochs** — the right end of the usual 2–4 range for LoRA, and the underfitting risk is the live one at rank 4 (2.3M trainable parameters), not overfitting. `TrainingOutcome` records `examples_seen` and `epochs`, so the record states its own epoch count.
+
+**The corpus is shuffled once per epoch.** Walking `index % n` presented every epoch in the same order, correlating epoch two's gradient noise with epoch one's — invisible while the loop only ever completed half an epoch, and a real defect the moment it did more. `ExampleSchedule` is a pure function of seed and global position, so a preempted run resumes the same walk and two Groups at one seed see the corpus in the same order.
+
+**Consequence.** The B2 hash `335406…` published in the merged checkpoint's provenance is no longer reproducible from the repository. The old artefacts remain valid statements about the configuration that produced them; the merged model needs regenerating from the new B2 to stay current.
+
 ## Follow-on
 
-- The checked-in `layer_mapping` in `base.yaml` maps `(29, 39)`; the proportional rule derives `(29, 40)`. The pairs are data and are recorded on every run record, so the mapping a run used is checkable either way — but the two disagree. Left alone deliberately: changing `base.yaml` changes **every** config hash, including those of the already-trained B1 and B2 checkpoints and the published merged B2 model. The spec has B3 re-run under the probe-based mapping anyway, which is the natural moment to fix it.
-- `batch_size` is still declared and not honoured — the loop consumes one example per step. It affects every Group equally, so B2-to-B5 comparisons stay valid, but the step budget does not mean what the config says.
+- The probe-based layer mapping replaces the proportional placeholder once the mapping study concludes, at which point B3 and B5 are re-run (spec, "Layer mapping").

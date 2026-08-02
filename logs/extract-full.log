@@ -1,0 +1,32 @@
+Loading weights:   0%|          | 0/1013 [00:00<?, ?it/s]Loading weights:   0%|          | 2/1013 [00:00<02:58,  5.66it/s]Loading weights:   0%|          | 4/1013 [00:00<02:33,  6.58it/s]Loading weights:   2%|▏         | 25/1013 [00:00<00:26, 36.76it/s]Loading weights:   3%|▎         | 29/1013 [00:01<00:38, 25.87it/s]Loading weights:   5%|▍         | 48/1013 [00:01<00:21, 44.38it/s]Loading weights:   7%|▋         | 69/1013 [00:01<00:16, 56.53it/s]Loading weights:   8%|▊         | 76/1013 [00:01<00:19, 48.29it/s]Loading weights:   9%|▉         | 92/1013 [00:02<00:17, 52.49it/s]Loading weights:  11%|█         | 113/1013 [00:02<00:14, 61.76it/s]Loading weights:  12%|█▏        | 120/1013 [00:02<00:15, 55.91it/s]Loading weights:  15%|█▌        | 152/1013 [00:02<00:08, 97.47it/s]Loading weights:  16%|█▋        | 166/1013 [00:03<00:13, 64.73it/s]Loading weights:  18%|█▊        | 179/1013 [00:03<00:14, 57.76it/s]Loading weights:  20%|█▉        | 200/1013 [00:03<00:12, 63.83it/s]Loading weights:  21%|██        | 209/1013 [00:04<00:15, 50.94it/s]Loading weights:  22%|██▏       | 223/1013 [00:04<00:14, 55.22it/s]Loading weights:  24%|██▍       | 244/1013 [00:04<00:12, 60.94it/s]Loading weights:  25%|██▍       | 251/1013 [00:04<00:16, 47.17it/s]Loading weights:  26%|██▋       | 266/1013 [00:05<00:14, 51.67it/s]Loading weights:  28%|██▊       | 287/1013 [00:05<00:12, 59.51it/s]Loading weights:  29%|██▉       | 294/1013 [00:05<00:15, 46.05it/s]Loading weights:  31%|███       | 310/1013 [00:05<00:13, 53.58it/s]Loading weights:  33%|███▎      | 331/1013 [00:06<00:11, 60.12it/s]Loading weights:  33%|███▎      | 338/1013 [00:06<00:17, 39.35it/s]Loading weights:  37%|███▋      | 375/1013 [00:06<00:09, 65.47it/s]Loading weights:  38%|███▊      | 383/1013 [00:07<00:11, 53.20it/s]Loading weights:  39%|███▉      | 397/1013 [00:07<00:10, 59.73it/s]Loading weights:  41%|████▏     | 418/1013 [00:07<00:09, 65.38it/s]Loading weights:  42%|████▏     | 426/1013 [00:07<00:10, 57.35it/s]Loading weights:  44%|████▎     | 441/1013 [00:08<00:10, 56.24it/s]Loading weights:  46%|████▌     | 462/1013 [00:08<00:08, 63.11it/s]Loading weights:  46%|████▋     | 469/1013 [00:08<00:11, 48.96it/s]Loading weights:  48%|████▊     | 485/1013 [00:09<00:09, 56.91it/s]Loading weights:  50%|████▉     | 506/1013 [00:09<00:07, 65.42it/s]Loading weights:  51%|█████     | 513/1013 [00:09<00:09, 50.82it/s]Loading weights:  54%|█████▍    | 549/1013 [00:09<00:06, 76.82it/s]Loading weights:  55%|█████▌    | 558/1013 [00:10<00:07, 59.72it/s]Loading weights:  56%|█████▋    | 572/1013 [00:10<00:06, 65.12it/s]Loading weights:  59%|█████▊    | 593/1013 [00:10<00:05, 70.66it/s]Loading weights:  59%|█████▉    | 601/1013 [00:10<00:07, 53.86it/s]Loading weights:  61%|██████    | 616/1013 [00:11<00:06, 59.21it/s]Loading weights:  63%|██████▎   | 637/1013 [00:11<00:05, 68.42it/s]Loading weights:  64%|██████▎   | 645/1013 [00:11<00:05, 61.58it/s]Loading weights: 100%|██████████| 1013/1013 [00:11<00:00, 87.96it/s]
+[extract] caching ['combine_weights', 'hidden_states', 'top_k_logit_ids', 'top_k_logit_values', 'visual_advantage']
+[extract] store data/store-full/ce868fb1238868ac91e14b1f94c8ef61f71aa4984919c4cf762cfb290849b824
+[extract] 4282 to do, 0 already present
+[extract] 10/4282 examples
+[extract] 20/4282 examples
+[extract] 30/4282 examples
+[extract] 40/4282 examples
+[extract] 50/4282 examples
+[extract] 60/4282 examples
+[extract] 70/4282 examples
+[extract] 80/4282 examples
+[extract] 90/4282 examples
+[extract] 100/4282 examples
+[extract] 110/4282 examples
+[extract] 120/4282 examples
+[extract] 130/4282 examples
+[extract] 140/4282 examples
+[extract] 150/4282 examples
+[extract] 160/4282 examples
+[extract] 170/4282 examples
+[extract] 180/4282 examples
+[extract] 190/4282 examples
+[extract] 200/4282 examples
+[extract] 210/4282 examples
+[extract] 220/4282 examples
+[extract] 230/4282 examples
+[extract] 240/4282 examples
+[extract] 250/4282 examples
+[extract] 260/4282 examples
+[extract] 270/4282 examples
+[extract] 280/4282 examples
