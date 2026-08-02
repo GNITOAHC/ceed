@@ -312,28 +312,38 @@ def test_every_baseline_group_from_b0_to_b5_resolves(configs_dir):
 
 # -- the already-trained baselines keep their identity -----------------------
 
-# The hashes of the Groups that have been trained and whose checkpoints are on
-# disk. A run hash is a pure function of the whole configuration, so *any* new
-# field with a default, anywhere in the schema, silently changes them — and a
-# changed hash means a completed baseline is no longer found, is retrained from
-# zero, and no longer matches the provenance published beside its weights.
-FROZEN_BASELINE_HASHES = {
-    "b0": "1a02a200659d7494d858b3807b94c2edd759c20fccc607321f76ea79a7976b9b",
-    "b1": "a152004ac6dd3cc8986e5c00e200965d4e4c64044ea021c827eed65f46df527d",
-    "b2": "335406898cb860fe39d89d91c77b321370f7d5bb226b606febe40cbd44db2743",
+# Every baseline Group's run hash. A run hash is a pure function of the whole
+# configuration, so *any* new field with a default, anywhere in the schema,
+# silently changes them — and a changed hash means a completed baseline is no
+# longer found, is retrained from zero, and no longer matches the provenance
+# recorded beside its weights.
+#
+# These were last rolled deliberately, at ticket 08's configuration decision:
+# base.yaml's layer mapping was corrected to the proportional rule it claims to
+# follow, and `batch_size` became a setting the loop honours rather than one it
+# ignored. Both change what a run *is*, so every baseline was retrained.
+BASELINE_HASHES = {
+    "b0": "c185f0520f4623cfe57de5426a188a24fd2a0cba56b0548caa716935d23979f8",
+    "b1": "31802aeade4224c3b47c110b24ff1c4af0658aebb120931dc339a7692bda6127",
+    "b2": "c36ed63f557446cf075a2ba3c488b64730d8a69fbd55d41ea1ee79de0e8e314e",
+    "b3": "491ecce5a6e185ec3807660ef35f5f7cbd7ba16e6c90aec173d1ea9d3616fd59",
+    "b4": "0635d6e5dddc1996225a44bc9f11c57ca640c177934de62393c1b4eed68e13d5",
+    "b5": "28d83dc46af5f795735ce2cc85d3c54231a4fa8d3d00b465dbf3d90eac8da5aa",
 }
 
 
-@pytest.mark.parametrize(("group", "expected"), sorted(FROZEN_BASELINE_HASHES.items()))
+@pytest.mark.parametrize(("group", "expected"), sorted(BASELINE_HASHES.items()))
 def test_a_trained_baselines_run_hash_does_not_drift(group, expected, configs_dir):
-    """Adding a Group must not change the identity of the Groups already run.
+    """A schema change must not silently change the identity of a trained Group.
 
-    B0, B1 and B2 have run; B2's hash is published in the provenance of a merged
-    checkpoint. Extending the schema for B3 to B5 must leave all three untouched,
-    and this is the only thing that says so before the retraining bill arrives.
+    A hash that moves without anyone deciding it should costs a full retrain and
+    orphans whatever provenance was published beside the old weights. This is the
+    only thing that says so before that bill arrives.
 
-    If this fails, the fix is almost never to update the constant — it is to stop
-    the new field reaching a Group that does not use it.
+    If this fails, the fix is almost never to update the constant. It is either
+    to stop the new field reaching a Group that does not use it, or — if the
+    change really does alter what a run means — to roll these deliberately and
+    retrain, as ticket 08 did.
     """
     from ceed_core import resolve_group_config, run_hash
 

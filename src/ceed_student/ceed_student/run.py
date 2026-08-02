@@ -112,6 +112,7 @@ def run_group(
             }
             if training.lora_rank is not None:
                 metrics["train.lora_rank"] = float(training.lora_rank)
+            metrics["train.epochs"] = training.epochs
             # The auxiliary signal is the single independent variable of the whole
             # comparison, so each one's contribution is recorded by name.
             for name, value in training.auxiliary_metrics.items():
@@ -123,6 +124,9 @@ def run_group(
                     "lora_rank": training.lora_rank,
                     "steps": training.steps,
                     "steps_run": training.steps_run,
+                    "batch_size": training.batch_size,
+                    "examples_seen": training.examples_seen,
+                    "epochs": training.epochs,
                     "resumed": training.resumed,
                     "final_loss": training.final_loss,
                     "checkpoint_dir": checkpoint_dir,

@@ -178,6 +178,11 @@ class TrainingOutcome:
         steps: The step budget targeted (the config's ``steps``).
         steps_run: How many steps this invocation actually ran — zero when a
             completed checkpoint was reused.
+        batch_size: The examples per optimiser step, accumulated.
+        examples_seen: How many examples the whole run consumed
+            (``steps * batch_size``), recorded so the epoch count is read off the
+            record rather than recomputed from the config.
+        epochs: How many passes over the training corpus that came to.
         resumed: Whether the run continued from an existing checkpoint.
         initial_loss: The backbone loss at this invocation's first step (or the
             restored final loss if nothing ran).
@@ -201,6 +206,9 @@ class TrainingOutcome:
     lora_rank: int | None
     steps: int
     steps_run: int
+    batch_size: int
+    examples_seen: int
+    epochs: float
     resumed: bool
     initial_loss: float
     final_loss: float
@@ -241,6 +249,51 @@ def _move_batch(batch: TrainingBatch, device: Any) -> TrainingBatch:
         else batch.coupling_strength.to(device),
         artefacts={k: v.to(device) for k, v in batch.artefacts.items()},
     )
+
+
+class ExampleSchedule:
+    """Which example each micro-step of a run sees, deterministically.
+
+    Two properties matter and neither is free.
+
+    **The corpus is shuffled, once per epoch.** Walking the corpus in a fixed
+    cyclic order means every epoch presents the same examples in the same order,
+    so the gradient noise of epoch two is correlated with that of epoch one and
+    the optimiser sees far less of the variety it is being paid for. A per-epoch
+    permutation removes that.
+
+    **The order is a pure function of the seed and the global position.** A run
+    that is preempted at micro-step 40,000 and resumed must continue the same
+    walk, not restart it — so nothing here is stateful, and asking for position
+    *p* twice gives the same example twice. That also makes two Groups at the
+    same seed see the corpus in the *same* order, which is what keeps their
+    difference the auxiliary signal rather than the shuffle.
+    """
+
+    def __init__(self, n_examples: int, seed: int) -> None:
+        """Schedule a corpus of ``n_examples`` under ``seed``.
+
+        Raises:
+            ValueError: If there are no examples to schedule.
+        """
+        if n_examples <= 0:
+            raise ValueError("cannot schedule training over an empty corpus")
+        self.n_examples = n_examples
+        self.seed = seed
+        self._epoch = -1
+        self._order: Tensor = torch.empty(0, dtype=torch.long)
+
+    def _order_for(self, epoch: int) -> Tensor:
+        if epoch != self._epoch:
+            generator = torch.Generator().manual_seed(self.seed * 1_000_003 + epoch)
+            self._order = torch.randperm(self.n_examples, generator=generator)
+            self._epoch = epoch
+        return self._order
+
+    def index_at(self, position: int) -> int:
+        """Return the example index the run's ``position``-th micro-step sees."""
+        epoch, offset = divmod(position, self.n_examples)
+        return int(self._order_for(epoch)[offset])
 
 
 def resolve_lora_targets(model: torch.nn.Module, leaf_names: Sequence[str]) -> list[str]:
@@ -455,6 +508,7 @@ class AccelerateTrainer:
         model, probes, optimizer = accelerator.prepare(model, probes, optimizer)
 
         batches = self.build_batches(config)
+        order = ExampleSchedule(len(batches), config.seed)
         schedule = WarmupSchedule(training.warmup.backbone_only_steps, training.warmup.ramp_steps)
         hidden_layers = required_student_layers(signals)
         views = sorted(required_forward_views(signals))
@@ -480,30 +534,51 @@ class AccelerateTrainer:
         model.train()
         probes.train()
         for step in range(completed, training.steps):
-            batch = _move_batch(batches[step % len(batches)], accelerator.device)
-            forwards = {view: model.answer_forward(batch, view, hidden_layers) for view in views}
-            context = SignalContext(batch=batch, forwards=forwards)
-            backbone = backbone_loss(
-                context.original.logits,
-                batch.gold_token_ids,
-                batch.teacher_topk_ids,
-                batch.teacher_topk_values,
-                kd_weight=training.backbone.kd_weight,
-                temperature=training.backbone.kd_temperature,
-            )
-            terms = aux_terms(signals, context)
-            loss = training_loss(backbone, terms, step=step, schedule=schedule)
-
+            # One optimiser step over `batch_size` examples. The Student is 8B and
+            # a document image is thousands of visual tokens, so the batch is
+            # accumulated rather than stacked: identical gradients, one example's
+            # worth of activation memory.
             optimizer.zero_grad()
-            accelerator.backward(loss)
+            totals = {"loss": 0.0, "cross_entropy": 0.0, "kd": 0.0}
+            aux_totals: dict[str, float] = {}
+            for micro in range(training.batch_size):
+                position = step * training.batch_size + micro
+                batch = _move_batch(batches[order.index_at(position)], accelerator.device)
+                forwards = {
+                    view: model.answer_forward(batch, view, hidden_layers) for view in views
+                }
+                context = SignalContext(batch=batch, forwards=forwards)
+                backbone = backbone_loss(
+                    context.original.logits,
+                    batch.gold_token_ids,
+                    batch.teacher_topk_ids,
+                    batch.teacher_topk_values,
+                    kd_weight=training.backbone.kd_weight,
+                    temperature=training.backbone.kd_temperature,
+                )
+                terms = aux_terms(signals, context)
+                loss = training_loss(backbone, terms, step=step, schedule=schedule)
+
+                # Scaled by the accumulation, so the summed gradient is the mean
+                # over the batch and the learning rate means the same thing at any
+                # batch size.
+                accelerator.backward(loss / training.batch_size)
+
+                totals["loss"] += float(loss.detach()) / training.batch_size
+                totals["cross_entropy"] += (
+                    float(backbone.cross_entropy.detach()) / training.batch_size
+                )
+                totals["kd"] += float(backbone.kd.detach()) / training.batch_size
+                for term in terms:
+                    aux_totals[term.name] = (
+                        aux_totals.get(term.name, 0.0)
+                        + float(term.value.detach()) / training.batch_size
+                    )
+
             optimizer.step()
 
-            last = {
-                "loss": float(loss.detach()),
-                "cross_entropy": float(backbone.cross_entropy.detach()),
-                "kd": float(backbone.kd.detach()),
-            }
-            auxiliary = {term.name: float(term.value.detach()) for term in terms}
+            last = totals
+            auxiliary = aux_totals
             if step == completed:
                 initial_loss = last["loss"]
             if training.checkpoint_every and (step + 1) % training.checkpoint_every == 0:
@@ -522,6 +597,9 @@ class AccelerateTrainer:
             lora_rank=self.lora_rank if mode is ParamEfficiencyMode.LORA else None,
             steps=training.steps,
             steps_run=steps_run,
+            batch_size=training.batch_size,
+            examples_seen=training.steps * training.batch_size,
+            epochs=training.steps * training.batch_size / len(batches),
             resumed=resumed,
             initial_loss=initial_loss,
             final_loss=last["loss"],

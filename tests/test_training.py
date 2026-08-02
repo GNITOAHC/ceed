@@ -93,7 +93,7 @@ def a_trainer(tmp_path, batches=None, **kwargs) -> AccelerateTrainer:
     )
 
 
-def _config(mode=ParamEfficiencyMode.FULL, steps=6):
+def _config(mode=ParamEfficiencyMode.FULL, steps=6, batch_size=1):
     # A minimal object carrying only what the trainer reads off the config.
     from ceed_core import (
         ExtractionConfig,
@@ -115,7 +115,7 @@ def _config(mode=ParamEfficiencyMode.FULL, steps=6):
             ablation="mean-of-active",
             combine_weight="effective",
         ),
-        training=a_training_config(steps),
+        training=a_training_config(steps, batch_size=batch_size),
     )
 
 
@@ -231,3 +231,143 @@ def test_resolving_no_adaptable_target_is_refused():
     # An adapter that matches nothing would train nothing, silently.
     with pytest.raises(ValueError, match="no adaptable"):
         resolve_lora_targets(_VisionLanguage(), ["not_a_module"])
+
+
+# -- the batch the config declares is the batch that trains ------------------
+
+
+def test_a_step_consumes_batch_size_examples(tmp_path):
+    """`batch_size` means what it says.
+
+    It was declared and ignored for the whole of B1 and B2's first runs — the loop
+    took one example per step — so a config claiming 2000x8 actually saw 2000
+    examples, under half an epoch. Nothing failed; the run just meant something
+    other than what the config said.
+    """
+    batches = [a_batch(seed) for seed in range(16)]
+    seen: list[int] = []
+
+    class CountingStudent(TinyStudent):
+        def answer_forward(self, batch, view, hidden_layers=frozenset()):
+            seen.append(int(batch.gold_token_ids[0]))
+            return super().answer_forward(batch, view, hidden_layers)
+
+    trainer = AccelerateTrainer(
+        build_student=lambda config: CountingStudent(),
+        build_batches=lambda config: batches,
+        output_root=tmp_path,
+        cpu=True,
+    )
+    outcome = trainer.train(_config(steps=3, batch_size=4))
+
+    assert len(seen) == 12  # 3 steps x 4 examples
+    assert outcome.examples_seen == 12
+    assert outcome.batch_size == 4
+
+
+def test_accumulating_a_batch_gives_the_same_gradient_as_averaging_it(tmp_path):
+    """Accumulation is a memory strategy, not a different objective.
+
+    The Student is 8B and a page is thousands of visual tokens, so a batch is
+    summed one example at a time rather than stacked. That is only legitimate if
+    the resulting gradient is the mean over the batch — otherwise the learning
+    rate silently means something different at every batch size.
+    """
+    torch.manual_seed(0)
+    batches = [a_batch(0), a_batch(1), a_batch(2), a_batch(3)]
+
+    def loss_for(student, batch):
+        forward = student.answer_forward(batch, ForwardView.ORIGINAL)
+        from ceed_student.backbone import backbone_loss
+
+        return backbone_loss(
+            forward.logits,
+            batch.gold_token_ids,
+            batch.teacher_topk_ids,
+            batch.teacher_topk_values,
+            kd_weight=1.0,
+        ).total
+
+    accumulated = TinyStudent()
+    for batch in batches:
+        (loss_for(accumulated, batch) / len(batches)).backward()
+
+    averaged = TinyStudent()
+    averaged.load_state_dict(accumulated.state_dict())
+    torch.stack([loss_for(averaged, b) for b in batches]).mean().backward()
+
+    for left, right in zip(accumulated.parameters(), averaged.parameters(), strict=True):
+        assert torch.allclose(left.grad, right.grad, atol=1e-6)
+
+
+def test_the_reported_epoch_count_is_measured_not_asserted(tmp_path):
+    outcome = a_trainer(tmp_path, batches=[a_batch(i) for i in range(5)]).train(
+        _config(steps=10, batch_size=2)
+    )
+    assert outcome.examples_seen == 20
+    assert outcome.epochs == pytest.approx(4.0)  # 20 examples over a 5-example corpus
+
+
+# -- the order the corpus is walked in ---------------------------------------
+
+
+def test_a_schedule_covers_the_corpus_exactly_once_per_epoch():
+    """No example is repeated within an epoch and none is skipped.
+
+    Cycling `index % n` would do that too; the point of the permutation is the
+    next test.
+    """
+    from ceed_student.training import ExampleSchedule
+
+    schedule = ExampleSchedule(n_examples=7, seed=0)
+    for epoch in range(3):
+        walked = [schedule.index_at(epoch * 7 + offset) for offset in range(7)]
+        assert sorted(walked) == list(range(7))
+
+
+def test_successive_epochs_walk_the_corpus_in_different_orders():
+    # A fixed cyclic order presents the same examples in the same sequence every
+    # epoch, so epoch two's gradient noise repeats epoch one's.
+    from ceed_student.training import ExampleSchedule
+
+    schedule = ExampleSchedule(n_examples=32, seed=0)
+    first = [schedule.index_at(i) for i in range(32)]
+    second = [schedule.index_at(32 + i) for i in range(32)]
+    assert first != second
+
+
+def test_the_walk_is_a_pure_function_of_position_so_a_resumed_run_continues_it():
+    # A run preempted mid-epoch resumes at a global position; if the order were
+    # stateful it would restart the epoch and re-show examples it had just seen.
+    from ceed_student.training import ExampleSchedule
+
+    once = ExampleSchedule(n_examples=11, seed=3)
+    walked = [once.index_at(i) for i in range(25)]
+
+    resumed = ExampleSchedule(n_examples=11, seed=3)
+    assert [resumed.index_at(i) for i in range(17, 25)] == walked[17:25]
+
+
+def test_two_groups_at_one_seed_see_the_corpus_in_the_same_order():
+    # The Groups must differ in their auxiliary signal and nothing else; a
+    # different shuffle would put a second difference into every comparison.
+    from ceed_student.training import ExampleSchedule
+
+    left = ExampleSchedule(n_examples=20, seed=7)
+    right = ExampleSchedule(n_examples=20, seed=7)
+    assert [left.index_at(i) for i in range(40)] == [right.index_at(i) for i in range(40)]
+
+
+def test_a_different_seed_walks_a_different_order():
+    from ceed_student.training import ExampleSchedule
+
+    assert [ExampleSchedule(20, 0).index_at(i) for i in range(20)] != [
+        ExampleSchedule(20, 1).index_at(i) for i in range(20)
+    ]
+
+
+def test_scheduling_an_empty_corpus_is_refused():
+    from ceed_student.training import ExampleSchedule
+
+    with pytest.raises(ValueError, match="empty corpus"):
+        ExampleSchedule(n_examples=0, seed=0)

@@ -132,14 +132,17 @@ def test_a_single_pair_cannot_be_mismatched():
 # -- what a reviewer checks --------------------------------------------------
 
 
-def test_the_checked_in_base_mapping_is_recorded_explicitly(configs_dir):
-    """base.yaml states the pairs; it does not leave them to a convention.
+def test_the_checked_in_base_mapping_is_the_rule_it_claims_to_be(configs_dir):
+    """base.yaml's mapping is `proportional` and is actually proportional.
 
     Story 59 — a reviewer wants to see which layer mapping a reported B3 or E1
-    used — is satisfied by the pairs being data, whatever rule produced them.
+    used — needs more than the pairs being written down: a mapping labelled
+    `proportional` whose pairs no rule produces is exactly the implicit
+    convention a first-class object was built to kill. So the config is checked
+    against the constructor, not merely parsed.
     """
     from ceed_core.config import load_overlay
 
     mapping = LayerMapping.model_validate(load_overlay(configs_dir / "base.yaml")["layer_mapping"])
-    assert mapping.kind == "proportional"
-    assert len(mapping.pairs) == 3
+    derived = proportional_mapping(mapping.teacher_layers, TEACHER_LAYERS, STUDENT_LAYERS)
+    assert mapping == derived

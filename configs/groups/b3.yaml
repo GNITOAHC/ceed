@@ -21,6 +21,10 @@ auxiliary_signals:
   - name: hidden_state_projection
     weight: 1.0
 training:
+  # 2000 steps x 8 examples = 16,000 examples, ~3.7 passes over the 4,282-example
+  # training split. batch_size is honoured by gradient accumulation, so the
+  # Student sees one example's activations at a time and the gradient is the mean
+  # over eight -- the memory of batch 1 with the gradient noise of batch 8.
   steps: 2000
   learning_rate: 1.0e-4
   batch_size: 8
