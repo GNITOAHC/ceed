@@ -193,7 +193,7 @@ def build_inputs(
     Returns:
         The Teacher inputs, the prompt length in tokens, and the gold answer ids.
     """
-    from ceed_student.dataset import chat_messages
+    from ceed_student.dataset import answer_target_ids, chat_messages, turn_terminator_id
     from PIL import Image
 
     image = Image.open(io.BytesIO(image_store.get(example.image_fingerprint))).convert("RGB")
@@ -207,8 +207,11 @@ def build_inputs(
         return_tensors="pt",
     )
     prompt_ids = prompt["input_ids"][0]
+    # The identical span the Student is trained on: the gold answer *and* the
+    # token that ends the turn. Caching one token fewer would leave the Student
+    # with no teacher signal at the position where it must learn to stop.
     answer_ids = torch.tensor(
-        processor.tokenizer(example.answers[0], add_special_tokens=False)["input_ids"],
+        answer_target_ids(processor, example, turn_terminator_id(processor)),
         dtype=prompt_ids.dtype,
     )
     inputs = dict(prompt)

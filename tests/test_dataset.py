@@ -29,17 +29,33 @@ TOP_K = 3
 # The fake tokenizer maps each character to its ordinal, so an answer's token
 # count is its character count — easy to reason about in assertions.
 PROMPT_TOKENS = [1, 2, 3, 4, 5]
+# The token this fake template ends an assistant turn with, and which generation
+# would stop on. Supervising it is what teaches the Student to stop.
+TERMINATOR = 999
+
+
+class FakeTokenizer:
+    """Char-per-token, with a chat template that terminates an assistant turn."""
+
+    all_special_ids: tuple[int, ...] = (TERMINATOR,)
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+    def apply_chat_template(self, messages, add_generation_prompt=False, **kwargs):
+        ids = list(PROMPT_TOKENS)
+        if not add_generation_prompt:
+            for message in messages:
+                if message["role"] == "assistant":
+                    ids += [ord(c) for c in message["content"]] + [TERMINATOR]
+        return {"input_ids": ids}
 
 
 class FakeProcessor:
     """Stands in for the Student's processor: fixed prompt, char-per-token answers."""
 
-    class _Tok:
-        def __call__(self, text, add_special_tokens=False):
-            return {"input_ids": [ord(c) for c in text]}
-
     def __init__(self):
-        self.tokenizer = self._Tok()
+        self.tokenizer = FakeTokenizer()
 
     def apply_chat_template(self, messages, **kwargs):
         return {
@@ -66,7 +82,7 @@ def image_store(tmp_path, monkeypatch) -> ImageStore:
     return store
 
 
-def a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=2) -> ArtifactStore:
+def a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=3) -> ArtifactStore:
     """A store holding top-k logits for ``n_tokens`` answer tokens, keyed by ordinal."""
     metadata = StoreMetadata(
         extraction_fingerprint="fp-test",
@@ -144,40 +160,76 @@ def test_encoding_appends_the_gold_answer_to_the_prompt(image_store):
     inputs, prompt_length, answer_ids = encode_example(FakeProcessor(), an_example(), image_store)
 
     assert prompt_length == len(PROMPT_TOKENS)
-    assert answer_ids.tolist() == [ord("a"), ord("b")]
-    # Teacher forcing: the sequence is prompt then gold answer.
-    assert inputs["input_ids"][0].tolist() == [*PROMPT_TOKENS, ord("a"), ord("b")]
+    assert answer_ids.tolist() == [ord("a"), ord("b"), TERMINATOR]
+    # Teacher forcing: the sequence is prompt, gold answer, end of turn.
+    assert inputs["input_ids"][0].tolist() == [*PROMPT_TOKENS, ord("a"), ord("b"), TERMINATOR]
     assert inputs["attention_mask"].shape == inputs["input_ids"].shape
 
 
+def test_the_supervised_span_ends_with_the_token_that_stops_generation():
+    """Supervising the answer alone teaches what to say and never when to stop.
+
+    Measured, not hypothesised: B1 — supervised fine-tuning with no teacher —
+    reached a training cross-entropy of 0.13 over 3.7 epochs and a DocVQA score
+    of 0.32, emitting the right answer and then transcribing the rest of the
+    page. The distilling Groups were shielded by the teacher's distribution, so
+    the defect presented as a B1 problem rather than a corpus-wide one.
+    """
+    from ceed_student.dataset import answer_target_ids, turn_terminator_id
+
+    processor = FakeProcessor()
+    terminator = turn_terminator_id(processor)
+    assert terminator == TERMINATOR
+    assert answer_target_ids(processor, an_example(answer="ab"), terminator) == [
+        ord("a"),
+        ord("b"),
+        TERMINATOR,
+    ]
+
+
+def test_a_template_that_terminates_nothing_supervises_the_answer_alone():
+    # Not every Student's template appends a stop token; one that does not must
+    # not have a spurious id invented for it.
+    from ceed_student.dataset import answer_target_ids
+
+    assert answer_target_ids(FakeProcessor(), an_example(answer="ab"), None) == [
+        ord("a"),
+        ord("b"),
+    ]
+
+
 def test_answer_positions_are_where_the_answer_tokens_are_predicted(tmp_path, image_store):
-    store = a_teacher_store(tmp_path, n_tokens=2)
+    store = a_teacher_store(tmp_path, n_tokens=3)
     batches = build_batches(FakeProcessor(), [an_example()], image_store, store, kd_weight=1.0)
 
     batch = batches[0]
-    # Two answer tokens, predicted at the prompt's last position and the one after.
-    assert batch.answer_token_positions.tolist() == [len(PROMPT_TOKENS) - 1, len(PROMPT_TOKENS)]
-    assert batch.gold_token_ids.tolist() == [ord("a"), ord("b")]
+    # Three supervised tokens, predicted from the prompt's last position onward.
+    assert batch.answer_token_positions.tolist() == [
+        len(PROMPT_TOKENS) - 1,
+        len(PROMPT_TOKENS),
+        len(PROMPT_TOKENS) + 1,
+    ]
+    assert batch.gold_token_ids.tolist() == [ord("a"), ord("b"), TERMINATOR]
 
 
 def test_the_teacher_topk_is_read_in_answer_token_order(tmp_path, image_store):
-    store = a_teacher_store(tmp_path, n_tokens=2)
+    store = a_teacher_store(tmp_path, n_tokens=3)
     batch = build_batches(FakeProcessor(), [an_example()], image_store, store, kd_weight=1.0)[0]
 
-    assert batch.teacher_topk_ids.shape == (2, TOP_K)
-    assert batch.teacher_topk_values.shape == (2, TOP_K)
+    assert batch.teacher_topk_ids.shape == (3, TOP_K)
+    assert batch.teacher_topk_values.shape == (3, TOP_K)
     # Ordinal 0's cached ids come first, ordinal 1's second.
     assert batch.teacher_topk_ids[0].tolist() == [0, 1, 2]
     assert batch.teacher_topk_ids[1].tolist() == [1, 2, 3]
 
 
 def test_positions_gold_and_teacher_rows_all_have_one_entry_per_answer_token(tmp_path, image_store):
-    store = a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=3)
+    store = a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=4)
     example = an_example(answer="abc")
     batch = build_batches(FakeProcessor(), [example], image_store, store, kd_weight=1.0)[0]
 
     n = len(batch.gold_token_ids)
-    assert n == 3
+    assert n == 4  # three answer tokens and the terminator
     assert len(batch.answer_token_positions) == n
     assert batch.teacher_topk_ids.shape[0] == n
     assert batch.teacher_topk_values.shape[0] == n
@@ -191,8 +243,8 @@ def test_a_teacher_free_group_builds_without_a_store(image_store):
     batches = build_batches(FakeProcessor(), [an_example()], image_store, None, kd_weight=0.0)
 
     batch = batches[0]
-    assert batch.teacher_topk_ids.shape == (2, 1)  # gold-only placeholder
-    assert torch.equal(batch.teacher_topk_values, torch.zeros(2, 1))
+    assert batch.teacher_topk_ids.shape == (3, 1)  # gold-only placeholder
+    assert torch.equal(batch.teacher_topk_values, torch.zeros(3, 1))
     assert batch.teacher_topk_ids[:, 0].tolist() == batch.gold_token_ids.tolist()
 
 
@@ -206,7 +258,7 @@ def test_a_store_missing_an_answer_token_fails_rather_than_misaligning(tmp_path,
     # The store holds two tokens but the Student encodes three: a tokenisation
     # disagreement that must surface, since misaligned supervision is silent.
     store = a_teacher_store(tmp_path, n_tokens=2)
-    with pytest.raises(ValueError, match=r"store 2, Student 3"):
+    with pytest.raises(ValueError, match=r"store 2, Student 4"):
         build_batches(
             FakeProcessor(), [an_example(answer="abc")], image_store, store, kd_weight=1.0
         )
@@ -218,7 +270,7 @@ def test_an_example_the_store_never_covered_fails_rather_than_training_on_nothin
     # A corpus example with no rows at all: the store was built from a different
     # corpus, or extraction did not finish. Either way the Group must not quietly
     # train on the examples that happen to be present.
-    store = a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=2)
+    store = a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=3)
     with pytest.raises(ValueError, match="no rows for 1 of 1"):
         build_batches(
             FakeProcessor(),
@@ -236,7 +288,7 @@ def test_the_placeholder_topk_contributes_nothing_to_the_backbone(image_store):
     from ceed_student import backbone_loss
 
     batch = build_batches(FakeProcessor(), [an_example()], image_store, None, kd_weight=0.0)[0]
-    logits = torch.randn(2, 300)
+    logits = torch.randn(len(batch.gold_token_ids), 1000)
     loss = backbone_loss(
         logits,
         batch.gold_token_ids,
@@ -250,7 +302,7 @@ def test_the_placeholder_topk_contributes_nothing_to_the_backbone(image_store):
 # -- auxiliary artefacts, read by the same ordinal key -----------------------
 
 
-def a_signal_store(tmp_path, example_id="docvqa:q1", n_tokens=2) -> ArtifactStore:
+def a_signal_store(tmp_path, example_id="docvqa:q1", n_tokens=3) -> ArtifactStore:
     """A store also holding the per-token artefacts B3, B4 and B5 read.
 
     Each token's values are distinct and derived from its ordinal, so a read that
@@ -299,9 +351,9 @@ def test_auxiliary_artefacts_are_stacked_in_answer_token_order(tmp_path, image_s
     hidden = batches[0].artefacts["hidden_states"]
     advantage = batches[0].artefacts["visual_advantage"]
 
-    # One row per answer token, in ordinal order, with the store's own shapes.
-    assert hidden.shape == (2, 2, 3)
-    assert torch.equal(advantage.reshape(-1), torch.tensor([0.0, 0.5]))
+    # One row per supervised token, in ordinal order, with the store's own shapes.
+    assert hidden.shape == (3, 2, 3)
+    assert torch.equal(advantage.reshape(-1), torch.tensor([0.0, 0.5, 1.0]))
     assert torch.equal(hidden[0], torch.zeros(2, 3))
     assert torch.equal(hidden[1], torch.ones(2, 3))
 

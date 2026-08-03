@@ -318,17 +318,18 @@ def test_every_baseline_group_from_b0_to_b5_resolves(configs_dir):
 # longer found, is retrained from zero, and no longer matches the provenance
 # recorded beside its weights.
 #
-# These were last rolled deliberately, at ticket 08's configuration decision:
-# base.yaml's layer mapping was corrected to the proportional rule it claims to
-# follow, and `batch_size` became a setting the loop honours rather than one it
-# ignored. Both change what a run *is*, so every baseline was retrained.
+# These were last rolled deliberately, when the supervised span was corrected to
+# include the token that ends the assistant's turn. Before that, base.yaml's
+# layer mapping was corrected to the proportional rule it claims to follow, and
+# `batch_size` became a setting the loop honours rather than one it ignored.
+# Each changes what a run *is*, so every baseline was retrained.
 BASELINE_HASHES = {
-    "b0": "c185f0520f4623cfe57de5426a188a24fd2a0cba56b0548caa716935d23979f8",
-    "b1": "31802aeade4224c3b47c110b24ff1c4af0658aebb120931dc339a7692bda6127",
-    "b2": "c36ed63f557446cf075a2ba3c488b64730d8a69fbd55d41ea1ee79de0e8e314e",
-    "b3": "491ecce5a6e185ec3807660ef35f5f7cbd7ba16e6c90aec173d1ea9d3616fd59",
-    "b4": "0635d6e5dddc1996225a44bc9f11c57ca640c177934de62393c1b4eed68e13d5",
-    "b5": "28d83dc46af5f795735ce2cc85d3c54231a4fa8d3d00b465dbf3d90eac8da5aa",
+    "b0": "4936b71280131892723b66cef21ad0535366597955a8021e8d3626e8ca97de1f",
+    "b1": "4cc9ec6e275678d5da0f4bc4a63ac6e1d23c1ef93ebaee739293fbb81e7b6455",
+    "b2": "b549d25703206bce7cea95110cd22bd5b333b97091f7a1af9f1517861e1a2321",
+    "b3": "43c86901570689bfe239587660aa77f095ff80d1b4ff258505f3d377fb27f624",
+    "b4": "c4c052901e2ffcb0e3287b557155b515046f641063428ccd49103cf3d692167e",
+    "b5": "effd5294fe8cf1a05800ce00e48ad0700dcae4d5fbdd5731928c238b493914b0",
 }
 
 

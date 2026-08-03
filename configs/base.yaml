@@ -24,3 +24,8 @@ extraction:
   ablation: mean-of-active
   combine_weight: effective
   thinking_enabled: false
+  # The supervised span is the gold answer *plus* the token that ends the turn.
+  # Training on the answer alone teaches the Student what to say and never when
+  # to stop: B1 reached a training cross-entropy of 0.13 and a DocVQA score of
+  # 0.32 by answering correctly and then transcribing the rest of the page.
+  answer_span: gold+turn_end

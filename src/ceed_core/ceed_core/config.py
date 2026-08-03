@@ -109,6 +109,13 @@ class ExtractionConfig(_Frozen):
         combine_weight: The combine-weight definition (e.g. ``effective``).
         thinking_enabled: Whether the Teacher's thinking gate is on. Disabled
             everywhere in CEED.
+        answer_span: Which tokens count as answer tokens, and therefore which
+            positions the Teacher is measured at and the Student supervised on.
+            ``gold+turn_end`` is the gold answer followed by the token that ends
+            the assistant's turn; ``gold`` is the answer alone. This is part of
+            the fingerprint because it changes how many rows an example has, so a
+            store built under one convention describes different positions from a
+            store built under the other.
     """
 
     teacher_model: str
@@ -117,6 +124,15 @@ class ExtractionConfig(_Frozen):
     ablation: str
     combine_weight: str
     thinking_enabled: bool = False
+    answer_span: str = "gold+turn_end"
+
+    @field_validator("answer_span")
+    @classmethod
+    def _known_span(cls, value: str) -> str:
+        allowed = {"gold", "gold+turn_end"}
+        if value not in allowed:
+            raise ValueError(f"answer_span must be one of {sorted(allowed)}, got {value!r}")
+        return value
 
 
 class BackboneConfig(_Frozen):

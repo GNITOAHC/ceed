@@ -39,6 +39,10 @@ from ceed_student.training import TrainingBatch
 TOP_K_LOGIT_IDS = "top_k_logit_ids"
 TOP_K_LOGIT_VALUES = "top_k_logit_values"
 
+# Sentinel for "derive the terminator from the processor", so that passing None
+# explicitly means "this template has none" rather than "work it out".
+_UNSET: Any = object()
+
 
 def answer_text(example: Example) -> str:
     """Return the gold answer a Group trains the Student on.
@@ -90,25 +94,93 @@ def load_image(image_store: ImageStore, example: Example) -> Any:
     return Image.open(io.BytesIO(image_store.get(example.image_fingerprint))).convert("RGB")
 
 
+def turn_terminator_id(processor: Any) -> int | None:
+    """Return the token that ends an assistant turn, read off the chat template.
+
+    Derived rather than hardcoded: render a one-word assistant turn, diff it
+    against the same turn's generation prompt, and take the first token of the
+    remainder that the model would stop on. On gemma-4 that is ``<turn|>``; on
+    another Student it will be whatever that Student's template uses.
+
+    Args:
+        processor: The Student's processor.
+
+    Returns:
+        The terminator's token id, or ``None`` if the template appends nothing
+        after the assistant's own text.
+    """
+    tokenizer = processor.tokenizer
+    probe = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    full = tokenizer.apply_chat_template(probe, tokenize=True, return_dict=True)["input_ids"]
+    prompt = tokenizer.apply_chat_template(
+        probe[:1], tokenize=True, add_generation_prompt=True, return_dict=True
+    )["input_ids"]
+    common = 0
+    while common < min(len(prompt), len(full)) and prompt[common] == full[common]:
+        common += 1
+    # The answer's own tokens come first; the terminator is the first token after
+    # them that generation would halt on.
+    stops = set(getattr(tokenizer, "all_special_ids", []) or [])
+    for token in full[common:]:
+        if token in stops:
+            return int(token)
+    return None
+
+
+def answer_target_ids(processor: Any, example: Example, terminator: int | None) -> list[int]:
+    """Return the tokens a Group supervises for one example: the answer, then stop.
+
+    **The terminator is supervised, and this is load-bearing.** Training on the
+    answer's tokens alone teaches the Student what to say and never teaches it to
+    stop saying it. Measured: B1 — supervised fine-tuning with no teacher — drove
+    its cross-entropy to 0.13 over 3.7 epochs and its DocVQA score to 0.32, by
+    emitting the correct answer and then continuing to transcribe the page. The
+    distilling Groups were shielded by the teacher's distribution acting as a
+    regulariser, which is the only reason the defect looked like a B1 problem
+    rather than a corpus-wide one.
+
+    Args:
+        processor: The Student's processor.
+        example: The example to supervise.
+        terminator: The turn terminator from :func:`turn_terminator_id`, or
+            ``None`` for a template that has none.
+
+    Returns:
+        The supervised token ids, in order.
+    """
+    ids = list(processor.tokenizer(answer_text(example), add_special_tokens=False)["input_ids"])
+    if terminator is not None:
+        ids.append(terminator)
+    return ids
+
+
 def encode_example(
-    processor: Any, example: Example, image_store: ImageStore
+    processor: Any,
+    example: Example,
+    image_store: ImageStore,
+    terminator: int | None = _UNSET,
 ) -> tuple[dict[str, torch.Tensor], int, torch.Tensor]:
     """Tokenise one example into Student inputs plus its answer-token targets.
 
     The prompt is rendered through the Student's chat template with the
-    generation prompt appended, then the gold answer's tokens are concatenated —
-    this is teacher forcing, and it makes the Student's targets exactly the gold
-    answer tokens (ADR-0002).
+    generation prompt appended, then the supervised answer tokens are
+    concatenated — this is teacher forcing, and it makes the Student's targets
+    exactly the gold answer plus the token that ends the turn (ADR-0002).
 
     Args:
         processor: The Student's processor.
         example: The example to encode.
         image_store: Where the example's image bytes live.
+        terminator: The turn terminator, resolved from the processor when not
+            supplied. Callers encoding a corpus pass it once rather than
+            re-deriving it per example.
 
     Returns:
-        The Student inputs, the prompt length in tokens, and the gold answer's
-        token ids.
+        The Student inputs, the prompt length in tokens, and the supervised
+        answer token ids.
     """
+    if terminator is _UNSET:
+        terminator = turn_terminator_id(processor)
     image = load_image(image_store, example)
     prompt = processor.apply_chat_template(
         chat_messages(example, image),
@@ -119,8 +191,7 @@ def encode_example(
     )
     prompt_ids = prompt["input_ids"][0]
     answer_ids = torch.tensor(
-        processor.tokenizer(answer_text(example), add_special_tokens=False)["input_ids"],
-        dtype=prompt_ids.dtype,
+        answer_target_ids(processor, example, terminator), dtype=prompt_ids.dtype
     )
 
     inputs = dict(prompt)
@@ -240,6 +311,8 @@ class EncodedCorpus(Sequence[TrainingBatch]):
         self.image_store = image_store
         self.cached = cached
         self.artefact_kinds = list(artefact_kinds)
+        # Resolved once: it is a property of the template, not of an example.
+        self.terminator = turn_terminator_id(processor)
 
     def __len__(self) -> int:
         """The number of training examples."""
@@ -249,7 +322,7 @@ class EncodedCorpus(Sequence[TrainingBatch]):
         """Encode one example into a batch, pairing it with the teacher's cache."""
         example = self.examples[index]
         inputs, prompt_length, answer_ids = encode_example(
-            self.processor, example, self.image_store
+            self.processor, example, self.image_store, self.terminator
         )
         n_answer = int(answer_ids.shape[0])
         # Answer token t is predicted at position t-1; the first answer token is
@@ -351,6 +424,7 @@ def verify_alignment(
         ValueError: If the store covers no rows for an example, or holds a
             different number of answer tokens than the Student will encode.
     """
+    terminator = turn_terminator_id(processor)
     missing: list[str] = []
     mismatched: list[str] = []
     for example in examples:
@@ -358,9 +432,7 @@ def verify_alignment(
         if not rows:
             missing.append(example.example_id)
             continue
-        n_answer = len(
-            processor.tokenizer(answer_text(example), add_special_tokens=False)["input_ids"]
-        )
+        n_answer = len(answer_target_ids(processor, example, terminator))
         held = int(rows[TOP_K_LOGIT_IDS].shape[0])
         if held != n_answer:
             mismatched.append(f"{example.example_id} (store {held}, Student {n_answer})")
