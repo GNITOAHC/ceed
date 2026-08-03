@@ -221,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         def build_training_batches(cfg: GroupConfig) -> Any:
             _, processor = load_for_training(cfg)
             assert cfg.training is not None
-            print("[run] encoding training batches ...", flush=True)
+            print("[run] reading the teacher's cached rows ...", flush=True)
             return build_batches(
                 processor,
                 train_examples,

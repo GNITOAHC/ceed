@@ -23,7 +23,7 @@ the same convention the teacher-side extraction uses.
 from __future__ import annotations
 
 import io
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +196,84 @@ def placeholder_topk(answer_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return ids, torch.zeros_like(ids, dtype=torch.float32)
 
 
+class EncodedCorpus(Sequence[TrainingBatch]):
+    """The training corpus as batches, encoded when the loop asks for one.
+
+    Encoding every example up front is what a small corpus lets you get away
+    with. It does not survive this one: a page's ``pixel_values`` alone is 7.7 MB,
+    so 4,282 examples is tens of gigabytes per process, and four Groups training
+    in parallel took the host's OOM killer with them at 61 GB resident each. The
+    encode is also pure waste at startup — several minutes before a single
+    optimiser step.
+
+    So an example is encoded when it is indexed and released when the step ends.
+    The teacher's cached artefacts *are* held: they are read in one query (a
+    per-cell read costs hours) and come to well under a gigabyte for the whole
+    corpus, which is the part worth keeping.
+
+    Re-encoding costs roughly 0.13 s per example against 0.56 s of training, and
+    buys a memory footprint that does not grow with the corpus — which is what
+    lets the Groups run in parallel at all, and what will let GQA and ChartQA
+    join the corpus without this becoming a problem again.
+    """
+
+    def __init__(
+        self,
+        processor: Any,
+        examples: Sequence[Example],
+        image_store: ImageStore,
+        cached: Mapping[str, Mapping[str, np.ndarray]],
+        artefact_kinds: Sequence[str] = (),
+    ) -> None:
+        """Hold what is cheap to keep and defer what is not.
+
+        Args:
+            processor: The Student's processor.
+            examples: The training examples, already split and ordered.
+            image_store: Where example images live.
+            cached: The teacher's artefacts, keyed by example then kind; empty
+                for a teacher-free Group.
+            artefact_kinds: The kinds this Group's auxiliary signals read.
+        """
+        self.processor = processor
+        self.examples = list(examples)
+        self.image_store = image_store
+        self.cached = cached
+        self.artefact_kinds = list(artefact_kinds)
+
+    def __len__(self) -> int:
+        """The number of training examples."""
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> TrainingBatch:  # type: ignore[override]
+        """Encode one example into a batch, pairing it with the teacher's cache."""
+        example = self.examples[index]
+        inputs, prompt_length, answer_ids = encode_example(
+            self.processor, example, self.image_store
+        )
+        n_answer = int(answer_ids.shape[0])
+        # Answer token t is predicted at position t-1; the first answer token is
+        # predicted at the prompt's final position.
+        positions = torch.arange(prompt_length - 1, prompt_length - 1 + n_answer)
+
+        artefacts: dict[str, torch.Tensor] = {}
+        if not self.cached:
+            topk_ids, topk_values = placeholder_topk(answer_ids)
+        else:
+            rows = self.cached.get(example.example_id, {})
+            topk_ids, topk_values = topk_from(rows, example.example_id, n_answer)
+            artefacts = artefacts_from(rows, self.artefact_kinds)
+
+        return TrainingBatch(
+            student_inputs=inputs,
+            answer_token_positions=positions,
+            gold_token_ids=answer_ids.to(torch.long),
+            teacher_topk_ids=topk_ids,
+            teacher_topk_values=topk_values,
+            artefacts=artefacts,
+        )
+
+
 def build_batches(
     processor: Any,
     examples: Sequence[Example],
@@ -203,24 +281,27 @@ def build_batches(
     store: ArtifactStore | None,
     kd_weight: float,
     artefact_kinds: Sequence[str] = (),
-    progress: Callable[[int, int], None] | None = None,
-) -> list[TrainingBatch]:
-    """Build one training batch per example, pairing it with the teacher's cache.
+) -> EncodedCorpus:
+    """Return the Group's training corpus, ready to be indexed a batch at a time.
+
+    The teacher's cached rows are read here, in one query, and checked against
+    the corpus before training starts: an example the store never covered, or one
+    whose answer tokenises to a different length than extraction recorded, is a
+    misalignment that must surface now rather than as a quietly wrong number.
 
     Args:
         processor: The Student's processor.
         examples: The training examples, already split and ordered.
         image_store: Where example images live.
-        store: The artifact store holding the teacher's top-k logits, or ``None``
+        store: The artifact store holding the teacher's cached rows, or ``None``
             for a teacher-free Group (B1).
         kd_weight: The Group's distillation weight, used to refuse a teacher-free
             build for a Group that actually distils.
         artefact_kinds: The further artefact kinds the Group's auxiliary signals
-            declared — read into each batch alongside the backbone's targets.
-        progress: Optional callback invoked with ``(done, total)``.
+            declared.
 
     Returns:
-        One :class:`~ceed_student.training.TrainingBatch` per example.
+        The corpus as an indexable sequence of batches.
 
     Raises:
         ValueError: If ``store`` is ``None`` while the Group needs one, either to
@@ -244,36 +325,58 @@ def build_batches(
     if store is not None:
         wanted = [TOP_K_LOGIT_IDS, TOP_K_LOGIT_VALUES, *artefact_kinds]
         cached = store.vectors_by_example(wanted, [e.example_id for e in examples])
+        verify_alignment(processor, examples, cached)
 
-    batches: list[TrainingBatch] = []
-    for index, example in enumerate(examples):
-        inputs, prompt_length, answer_ids = encode_example(processor, example, image_store)
-        n_answer = int(answer_ids.shape[0])
-        if n_answer == 0:
+    return EncodedCorpus(processor, examples, image_store, cached, artefact_kinds)
+
+
+def verify_alignment(
+    processor: Any,
+    examples: Sequence[Example],
+    cached: Mapping[str, Mapping[str, np.ndarray]],
+) -> None:
+    """Check the store covers the corpus, token for token, before training starts.
+
+    Encoding is lazy, so without this the first disagreement would surface at the
+    step that happens to reach it — hours in, on a Group that has already written
+    checkpoints. The check needs only the answer's tokens, not its image, so it
+    costs a text tokenisation per example and runs over the whole corpus up front.
+
+    Args:
+        processor: The Student's processor.
+        examples: The training examples.
+        cached: The teacher's rows, keyed by example then kind.
+
+    Raises:
+        ValueError: If the store covers no rows for an example, or holds a
+            different number of answer tokens than the Student will encode.
+    """
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for example in examples:
+        rows = cached.get(example.example_id)
+        if not rows:
+            missing.append(example.example_id)
             continue
-        # Answer token t is predicted at position t-1; the first answer token is
-        # predicted at the prompt's final position.
-        positions = torch.arange(prompt_length - 1, prompt_length - 1 + n_answer)
-        artefacts: dict[str, torch.Tensor] = {}
-        if store is None:
-            topk_ids, topk_values = placeholder_topk(answer_ids)
-        else:
-            rows = cached.get(example.example_id, {})
-            topk_ids, topk_values = topk_from(rows, example.example_id, n_answer)
-            artefacts = artefacts_from(rows, artefact_kinds)
-        batches.append(
-            TrainingBatch(
-                student_inputs=inputs,
-                answer_token_positions=positions,
-                gold_token_ids=answer_ids.to(torch.long),
-                teacher_topk_ids=topk_ids,
-                teacher_topk_values=topk_values,
-                artefacts=artefacts,
-            )
+        n_answer = len(
+            processor.tokenizer(answer_text(example), add_special_tokens=False)["input_ids"]
         )
-        if progress is not None:
-            progress(index + 1, len(examples))
-    return batches
+        held = int(rows[TOP_K_LOGIT_IDS].shape[0])
+        if held != n_answer:
+            mismatched.append(f"{example.example_id} (store {held}, Student {n_answer})")
+    if missing:
+        raise ValueError(
+            f"the store holds no rows for {len(missing)} of {len(examples)} training "
+            f"examples, starting with {missing[0]!r}; it was built from a different "
+            "corpus, or extraction did not finish"
+        )
+    if mismatched:
+        raise ValueError(
+            f"{len(mismatched)} example(s) tokenise to a different number of answer "
+            f"tokens than the store holds, starting with {mismatched[0]}; the two were "
+            "built from different prompts or tokenizers, and training would misalign "
+            "supervision"
+        )
 
 
 def load_corpus_split(

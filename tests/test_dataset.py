@@ -206,7 +206,7 @@ def test_a_store_missing_an_answer_token_fails_rather_than_misaligning(tmp_path,
     # The store holds two tokens but the Student encodes three: a tokenisation
     # disagreement that must surface, since misaligned supervision is silent.
     store = a_teacher_store(tmp_path, n_tokens=2)
-    with pytest.raises(ValueError, match=r"2 answer tokens .* Student encoded 3"):
+    with pytest.raises(ValueError, match=r"store 2, Student 3"):
         build_batches(
             FakeProcessor(), [an_example(answer="abc")], image_store, store, kd_weight=1.0
         )
@@ -219,7 +219,7 @@ def test_an_example_the_store_never_covered_fails_rather_than_training_on_nothin
     # corpus, or extraction did not finish. Either way the Group must not quietly
     # train on the examples that happen to be present.
     store = a_teacher_store(tmp_path, example_id="docvqa:q1", n_tokens=2)
-    with pytest.raises(ValueError, match="no rows for 'docvqa:missing'"):
+    with pytest.raises(ValueError, match="no rows for 1 of 1"):
         build_batches(
             FakeProcessor(),
             [an_example(example_id="docvqa:missing")],
@@ -340,3 +340,55 @@ def test_a_backbone_only_group_carries_no_artefacts(tmp_path, image_store):
         FakeProcessor(), [an_example()], image_store, a_teacher_store(tmp_path), kd_weight=1.0
     )
     assert batches[0].artefacts == {}
+
+
+# -- the corpus is encoded a batch at a time, not all at once ----------------
+
+
+def test_encoding_costs_scale_with_batches_asked_for_not_corpus_size(tmp_path, image_store):
+    """Encoding every example up front is what took the host's OOM killer.
+
+    A page's pixel_values alone is ~7.7 MB, so a 4,282-example corpus is tens of
+    gigabytes per process, and four Groups training in parallel does not fit in
+    329 GB. What must hold is that the work of building a corpus does not grow
+    with the corpus — so a 200-example corpus, indexed three times, encodes a
+    handful of examples and not two hundred.
+
+    (The slack is for the test tier only: beartype samples one element when it
+    checks a value against ``Sequence[TrainingBatch]``, and it is installed under
+    pytest alone.)
+    """
+    processor = FakeProcessor()
+    encoded: list[str] = []
+    original = processor.apply_chat_template
+    processor.apply_chat_template = lambda messages, **kw: (  # type: ignore[method-assign]
+        encoded.append("x") or original(messages, **kw)
+    )
+
+    corpus = build_batches(
+        processor,
+        [an_example(f"docvqa:q{i}") for i in range(200)],
+        image_store,
+        None,
+        kd_weight=0.0,
+    )
+    assert len(corpus) == 200
+    built = len(encoded)
+    assert built <= 2  # not 200
+
+    for index in (0, 7, 13):
+        corpus[index]
+    assert len(encoded) - built <= 4  # one per access, plus sampling slack
+
+
+def test_indexing_the_same_example_twice_gives_the_same_batch(tmp_path, image_store):
+    # Re-encoding is the price of not holding the corpus in memory; it is only
+    # safe because it is deterministic, so an example means the same thing in
+    # epoch one and epoch four.
+    corpus = build_batches(
+        FakeProcessor(), [an_example(answer="abc")], image_store, None, kd_weight=0.0
+    )
+    first, second = corpus[0], corpus[0]
+    assert torch.equal(first.gold_token_ids, second.gold_token_ids)
+    assert torch.equal(first.answer_token_positions, second.answer_token_positions)
+    assert torch.equal(first.student_inputs["input_ids"], second.student_inputs["input_ids"])
