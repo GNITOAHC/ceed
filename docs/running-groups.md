@@ -37,7 +37,7 @@ scripts/merge_adapter.py             # optional: fold the adapter into a standal
 The whole set, once the corpus and store exist:
 
 ```bash
-scripts/run_baselines.sh data/corpus data/store-full runs logs
+scripts/run_baselines.sh data/corpus data/store-full runs logs [steps]
 ```
 
 One Group per GPU — the Student is 8B in fp16 and fits on a single V100 alongside
@@ -61,8 +61,38 @@ uv run python scripts/build_corpus.py --output data/corpus --limit 200
 
 - `--limit` is **per dataset**, and **zero or negative means the whole source
   split**. Start small: the sources are gigabytes.
+- `--dataset-limit gqa=5000` overrides `--limit` for one dataset. The three
+  sources differ by three orders of magnitude, so one cap rarely suits all of
+  them.
 - `--datasets docvqa gqa chartqa` selects sources (all three by default).
 - Splits are fixed at 80/10/10 train/validation/test, seeded by `--seed`.
+- **A requested dataset that yields nothing fails the build.** Previously it was
+  warned about and dropped, which meant asking for three datasets and silently
+  getting one. `--allow-partial` restores the old behaviour when you mean it.
+
+### Which source split each dataset comes from
+
+These are the splits the published sources actually serve, which is not what
+their papers name:
+
+| Dataset | Source | Config | Split | Size |
+| --- | --- | --- | --- | --- |
+| DocVQA | `lmms-lab/DocVQA` | `DocVQA` | `validation` | ~5.3k questions |
+| GQA | `lmms-lab/GQA` | `{split}_balanced_instructions` **joined to** `{split}_balanced_images` | `train` | ~943k questions |
+| ChartQA | `lmms-lab/ChartQA` | `default` | `test` | ~2.5k questions |
+
+DocVQA withholds its test answers, so validation is the usable split. ChartQA
+publishes only `test`. CEED's own 80/10/10 re-split applies on top of whichever
+split it drew from, so CEED's `test` is held out from CEED regardless.
+
+**GQA is a join, not a stream.** Its questions and its images are in separate
+configs — the instructions config is text only, carrying an `imageId`. The loader
+takes a prefix of the images, then keeps the questions whose image it holds. The
+other direction reads all ~72k images to satisfy a few thousand questions. One
+consequence worth knowing: GQA examples carry **no `answer_region`**, because the
+answer-linked box lives in the scene-graph release rather than in the question
+rows. Nothing in B0–B5 reads it; Phase 2's region interventions will have to
+supply it.
 
 To take everything a source has:
 
@@ -70,10 +100,21 @@ To take everything a source has:
 uv run python scripts/build_corpus.py --output data/corpus-full --datasets docvqa --limit 0
 ```
 
-Note which source split that is: `build_corpus.py` draws DocVQA from the source
-**validation** split (~5.3k questions), GQA and ChartQA from **train**. "Full
-DocVQA" therefore means that split, not the ~39k DocVQA train split, and the
-80/10/10 re-split applies on top of it.
+Do not do that for GQA. `--limit 0` there means ~943k questions and every image
+behind them.
+
+### Check the sources before you trust a build
+
+The loaders talk to the Hub, so they are out of the fast tier. Run them
+deliberately:
+
+```bash
+uv run pytest -m slow tests/test_loaders_live.py
+```
+
+That is what says the sources still serve the fields the loaders read. Two of the
+three loaders were broken against the live Hub for a long time precisely because
+nothing exercised them.
 
 Produces:
 
@@ -84,8 +125,67 @@ data/corpus/
   images/                 # images addressed by content hash
 ```
 
-If a source fails (gated repo, renamed dataset) the script warns and continues
-with the rest, so one broken source does not cost you the others.
+### The corpus is part of a run's identity
+
+`corpus_manifest.json` hashes to a **corpus fingerprint** — a content hash of
+exactly which example ids landed in which split — and every entry point fills it
+into the Group's `corpus.fingerprint` before the run hash is computed.
+
+This is not bookkeeping. `CorpusConfig.name` is the constant `ceed-vqa` in every
+Group's overlay, so without the fingerprint a Group trained on DocVQA alone and
+the same Group trained on all three datasets hash **identically**, and the
+consequences are silent rather than loud:
+
+- `runs/<hash>/run_record.json` is overwritten, so the first result is replaced
+  by the second under a hash claiming to describe both;
+- the checkpoint directory is keyed by the resume key, which is that same hash
+  with the step budget normalised away — so the second run finds a
+  `progress.json` written by a matching configuration, adopts it, and, being
+  already at its step budget, **trains zero steps** before being scored on the
+  new corpus and reported as a new result.
+
+The resume guard cannot catch that on its own: it compares configurations, and
+the configurations really are identical. The corpus is what differs. Changing the
+corpus now changes the hash, so the two runs cannot collide.
+
+A corpus directory with no manifest — the synthetic ones the fast tier builds —
+contributes no fingerprint, and those Groups hash as they always did.
+
+### Building the three-dataset corpus
+
+The DocVQA-only corpus is the one the published baselines used. To train on
+everything CEED supports:
+
+```bash
+uv run python scripts/build_corpus.py \
+    --output data/corpus-all \
+    --datasets docvqa gqa chartqa \
+    --limit 0 \
+    --dataset-limit gqa=5000 \
+    --seed 0
+```
+
+`--limit 0` takes DocVQA and ChartQA whole; the override keeps GQA to a
+comparable share instead of the ~943k questions it would otherwise contribute.
+Roughly:
+
+| Dataset | Examples | Metric it is scored under |
+| --- | --- | --- |
+| DocVQA | ~5,350 | ANLS |
+| GQA | 5,000 | exact match |
+| ChartQA | ~2,500 | relaxed accuracy |
+| | **~12,850** → train ~10,280 / validation ~1,285 / test ~1,285 | |
+
+Two things follow from mixing sources that did not matter with one:
+
+- **The split is not stratified.** 80/10/10 is applied to the pooled corpus, so
+  each split's dataset mix is what chance gives it. With thousands per dataset
+  that is close enough to proportional; check `dataset_counts` in the manifest
+  and the per-dataset `n` in the run record rather than assuming.
+- **The evaluator reports one metric per dataset**, and there is no aggregate.
+  A run record on this corpus carries `docvqa`, `gqa` and `chartqa` separately —
+  which is correct, because ANLS and relaxed accuracy do not average into
+  anything meaningful.
 
 ## Step 2 — Cache the Teacher's artefacts (for B2 and above)
 
@@ -167,9 +267,18 @@ over the batch. So the training set is walked
 
     steps x batch_size / |train split|   times,
 
-which at the checked-in `2000 x 8` over 4,282 examples is **~3.7 epochs**. The run
-record carries `train.epochs` so this is read off the record rather than
-recomputed — and the metrics log carries `examples_seen` beside it.
+which at the checked-in `2000 x 8` over the 4,282-example DocVQA-only train split
+is **~3.7 epochs**. The run record carries `train.epochs` so this is read off the
+record rather than recomputed — and the metrics log carries `examples_seen`
+beside it.
+
+**The budget does not follow the corpus.** Enlarging the corpus without raising
+`steps` buys fewer passes over it, not more training, so a Group on a corpus
+2.4x the size at the same budget sees each example 1.6 times rather than 3.7.
+Decide which you are holding fixed — examples seen, or passes over the corpus —
+and say which in the write-up, because a Group compared against a baseline that
+held the other one fixed is not a comparison. `scripts/run_baselines.sh` takes
+the budget as its fifth argument for exactly this.
 
 The corpus is **shuffled once per epoch**, deterministically from the Group's
 seed. Two Groups at the same seed therefore walk it in the same order, which is
@@ -195,13 +304,14 @@ defaults to no cap. The corpus's own size is fixed earlier, by step 1.
 
 Two things about the step budget, as the loop currently stands:
 
-- **One step consumes one example.** `--steps` is therefore a count of examples
-  seen, not of batches: seeing a 4,000-example corpus once means `--steps 4000`.
-  The `batch_size` field in the Group's YAML is not yet read by the training
-  loop.
-- **Batches are encoded up front and held in memory** — roughly 8 MB per example
-  on DocVQA, dominated by pixel values. A few thousand examples is tens of GB
-  resident, and the encoding pass before training starts is not quick.
+- **One step consumes `batch_size` examples**, by gradient accumulation — the
+  Student sees one example's activations at a time and the optimiser steps on the
+  mean of eight. So `--steps` counts optimiser steps, not examples: walking a
+  4,282-example corpus once at `batch_size: 8` is `--steps 536`.
+- **Examples are encoded on demand, not up front.** `build_batches` reads every
+  cached teacher row in one query and returns a lazy corpus that encodes an
+  example when the loop indexes it. Encoding eagerly cost ~8 MB per example in
+  pixel values and took the host past its memory with four lanes running.
 
 What the script builds is decided by the Group's config, not by flags: a Group
 with no `training:` block never constructs a trainer, and a Group whose
@@ -247,7 +357,7 @@ run writes is an **adapter** — about 9 MB — not a full model; loading it mea
 loading the base Student and applying the adapter on top.
 
 ```
-runs/checkpoints/b1/checkpoint/
+runs/checkpoints/b1-<key>/checkpoint/
   adapter/                  # what inference loads (adapter_model.safetensors + config)
   model.safetensors         # accelerate's state, for *resuming* training
   optimizer.bin
@@ -273,7 +383,7 @@ uv run python scripts/infer.py --run runs/<config_hash> --image page.png \
     --question "What is the total?" --base
 ```
 
-`--checkpoint runs/checkpoints/b1/checkpoint` works too if you would rather name
+`--checkpoint runs/checkpoints/b1-<key>/checkpoint` works too if you would rather name
 the checkpoint directly than go through a run record.
 
 ### From Python

@@ -78,16 +78,26 @@ class CorpusConfig(_Frozen):
     """Which corpus a Group trains and evaluates on.
 
     ``None`` on a :class:`GroupConfig` denotes the null Group, which has no
-    corpus at all. A real corpus is fleshed out in a later ticket; here it only
-    needs to be nameable and hashable.
+    corpus at all.
+
+    The ``name`` is written by hand in the Group YAML and is therefore a label,
+    not evidence. The ``fingerprint`` is the corpus manifest's content hash,
+    filled in by the entry points from the corpus actually on disk, and it is what
+    makes the run hash a statement about what the run trained on. Without it two
+    runs over different corpora hash identically, and the second silently adopts
+    the first's completed checkpoint instead of training.
 
     Attributes:
-        name: The corpus identifier.
+        name: The corpus identifier, as written in the Group's overlay.
         splits: The split names the run draws from.
+        fingerprint: The manifest fingerprint of the corpus actually read, or
+            ``None`` where no corpus directory was resolved (unit tests, the null
+            Group).
     """
 
     name: str
     splits: tuple[str, ...] = ()
+    fingerprint: str | None = None
 
 
 class ExtractionConfig(_Frozen):

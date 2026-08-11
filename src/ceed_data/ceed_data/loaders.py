@@ -77,12 +77,19 @@ def make_gqa_example(
     question: str,
     answers: Sequence[str],
     image_fingerprint: str,
-    answer_region: BoundingBox,
+    answer_region: BoundingBox | None = None,
 ) -> Example:
     """Build a GQA example, carrying the scene-graph object box tied to the answer.
 
     GQA is intervention-eligible; its relevant region is the answer-linked object
     box, so the region is annotation-backed rather than inferred.
+
+    The region is optional because the published source does not carry it. GQA's
+    answer-linked boxes live in the scene-graph release, not in the question rows
+    ``lmms-lab/GQA`` serves, so an example assembled from that source has
+    ``answer_region=None``. That costs nothing for B0 to B5, which never read it,
+    and it is the region-based interventions in the later phases that will have to
+    supply the scene graph rather than assume it arrived with the questions.
     """
     return Example(
         example_id=f"{GQA}:{source_id}",
@@ -158,35 +165,62 @@ def load_docvqa(
         )
 
 
+#: How many questions the balanced GQA split carries per image, roughly. Used to
+#: decide how many images to pull for a requested number of examples; being wrong
+#: costs a few extra images or a short second pass, never correctness.
+GQA_QUESTIONS_PER_IMAGE = 8
+
+
 def load_gqa(
     split: str, image_store: ImageStore, limit: int | None = None
 ) -> Iterator[Example]:  # pragma: no cover - exercised out of the fast tier
-    """Stream GQA into Examples, carrying the answer-linked object box.
+    """Stream GQA into Examples by joining its questions to its images.
 
-    Assumes rows carry ``id``, ``question``, ``answer``, an ``image``, and the
-    answer object's pixel box as ``answer_box`` = ``(x, y, w, h)``.
+    Unlike DocVQA and ChartQA, ``lmms-lab/GQA`` does not serve one row per
+    question-with-image. It splits into ``{split}_balanced_instructions`` — the
+    questions, text only, carrying an ``imageId`` — and ``{split}_balanced_images``
+    — the images, keyed by that same id. Neither is usable alone, so this joins
+    them.
+
+    The join is **image-major**: a prefix of the images is taken, then the
+    questions are streamed and kept where their image is in hand. The other
+    direction — take the first N questions, then hunt their images — reads the
+    entire image config, because a question prefix references ids scattered
+    through all ~72k of them. This way the images downloaded are exactly the
+    images used.
+
+    Assumes question rows carry ``id``, ``imageId``, ``question`` and ``answer``,
+    and image rows carry ``id`` and ``image``. ``answer_region`` is left unset:
+    the answer-linked box is in the scene-graph release, not in this source.
     """
     from datasets import load_dataset
 
-    rows = load_dataset("lmms-lab/GQA", "train_all_instructions", split=split, streaming=True)
-    for index, row in enumerate(rows):
-        if limit is not None and index >= limit:
+    image_budget = None if limit is None else max(1, -(-limit // GQA_QUESTIONS_PER_IMAGE))
+    image_rows = load_dataset(
+        "lmms-lab/GQA", f"{split}_balanced_images", split=split, streaming=True
+    )
+    fingerprints: dict[str, str] = {}
+    for index, row in enumerate(image_rows):
+        if image_budget is not None and index >= image_budget:
             break
-        image = row["image"]
-        fingerprint = image_store.put(_encode_png(image))
+        fingerprints[str(row["id"])] = image_store.put(_encode_png(row["image"]))
+
+    question_rows = load_dataset(
+        "lmms-lab/GQA", f"{split}_balanced_instructions", split=split, streaming=True
+    )
+    yielded = 0
+    for row in question_rows:
+        if limit is not None and yielded >= limit:
+            break
+        fingerprint = fingerprints.get(str(row["imageId"]))
+        if fingerprint is None:
+            continue
+        yielded += 1
         yield make_gqa_example(
             source_id=str(row["id"]),
             question=row["question"],
             answers=[row["answer"]],
             image_fingerprint=fingerprint,
-            answer_region=normalize_box(
-                row["answer_box"][0],
-                row["answer_box"][1],
-                row["answer_box"][2],
-                row["answer_box"][3],
-                image.width,
-                image.height,
-            ),
         )
 
 
@@ -195,7 +229,10 @@ def load_chartqa(
 ) -> Iterator[Example]:  # pragma: no cover - exercised out of the fast tier
     """Stream ChartQA into Examples (never intervention-eligible, A8).
 
-    Assumes rows carry ``id``, ``question``, ``answer``, and an ``image``.
+    Assumes rows carry ``question``, ``answer``, and an ``image``. They carry no
+    identifier, so the example id is the row's position in the stream — stable for
+    a fixed source revision, which is what the corpus manifest pins anyway, and
+    checkable afterwards because the manifest records every id it assigned.
     """
     from datasets import load_dataset
 
@@ -205,7 +242,7 @@ def load_chartqa(
             break
         fingerprint = image_store.put(_encode_png(row["image"]))
         yield make_chartqa_example(
-            source_id=str(row["id"]),
+            source_id=str(index),
             question=row["question"],
             answers=[row["answer"]],
             image_fingerprint=fingerprint,

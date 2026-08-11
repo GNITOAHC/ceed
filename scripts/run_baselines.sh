@@ -23,7 +23,12 @@
 #       --top-k 64 --skip-correctness --all
 #
 # Usage:
-#   scripts/run_baselines.sh [corpus] [store] [output] [logdir]
+#   scripts/run_baselines.sh [corpus] [store] [output] [logdir] [steps]
+#
+# `steps` overrides every Group's step budget, which is what you want when the
+# corpus changes size: the budget is in optimiser steps, so a corpus twice as
+# large is walked half as many times for the same number. It does not change a
+# Group's resume key, so raising it continues a run rather than starting one.
 
 set -euo pipefail
 
@@ -31,6 +36,7 @@ CORPUS="${1:-data/corpus}"
 STORE="${2:-data/store-full}"
 OUTPUT="${3:-runs}"
 LOGDIR="${4:-logs}"
+STEPS="${5:-}"
 
 mkdir -p "$LOGDIR"
 
@@ -45,6 +51,8 @@ run_lane() {
     shift
     for group in "$@"; do
         local log="$LOGDIR/$group.log"
+        local budget=()
+        [ -n "$STEPS" ] && budget=(--steps "$STEPS")
         echo "[lane $gpu] starting $group -> $log ($(date -Is))"
         CUDA_VISIBLE_DEVICES="$gpu" PYTHONUNBUFFERED=1 \
             uv run python scripts/run_group.py \
@@ -52,6 +60,7 @@ run_lane() {
             --corpus "$CORPUS" \
             --store "$STORE" \
             --output "$OUTPUT" \
+            "${budget[@]}" \
             >"$log" 2>&1
         echo "[lane $gpu] finished $group ($(date -Is))"
     done

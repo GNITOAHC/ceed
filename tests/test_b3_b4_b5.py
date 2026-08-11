@@ -318,18 +318,28 @@ def test_every_baseline_group_from_b0_to_b5_resolves(configs_dir):
 # longer found, is retrained from zero, and no longer matches the provenance
 # recorded beside its weights.
 #
-# These were last rolled deliberately, when the supervised span was corrected to
-# include the token that ends the assistant's turn. Before that, base.yaml's
-# layer mapping was corrected to the proportional rule it claims to follow, and
-# `batch_size` became a setting the loop honours rather than one it ignored.
-# Each changes what a run *is*, so every baseline was retrained.
+# These were last rolled deliberately, when the corpus fingerprint entered the
+# run identity so that a Group trained on DocVQA alone could no longer adopt the
+# checkpoint of the same Group trained on DocVQA + GQA + ChartQA. Before that,
+# the supervised span was corrected to include the token that ends the
+# assistant's turn; base.yaml's layer mapping was corrected to the proportional
+# rule it claims to follow; and `batch_size` became a setting the loop honours
+# rather than one it ignored. Each changes what a run *is*, so every baseline was
+# retrained.
+#
+# These are resolved from the overlays alone, so they carry no corpus
+# fingerprint. A real run resolves against a corpus directory and its hash
+# therefore differs from the value here — deliberately, because that is the whole
+# point of the fingerprint. What this pins is the *configuration's* contribution
+# to the identity, which is what an accidental schema change would move. To find
+# a run's directory, read `runs/*/run_record.json`; do not compute it from these.
 BASELINE_HASHES = {
-    "b0": "4936b71280131892723b66cef21ad0535366597955a8021e8d3626e8ca97de1f",
-    "b1": "4cc9ec6e275678d5da0f4bc4a63ac6e1d23c1ef93ebaee739293fbb81e7b6455",
-    "b2": "b549d25703206bce7cea95110cd22bd5b333b97091f7a1af9f1517861e1a2321",
-    "b3": "43c86901570689bfe239587660aa77f095ff80d1b4ff258505f3d377fb27f624",
-    "b4": "c4c052901e2ffcb0e3287b557155b515046f641063428ccd49103cf3d692167e",
-    "b5": "effd5294fe8cf1a05800ce00e48ad0700dcae4d5fbdd5731928c238b493914b0",
+    "b0": "aa7594d4d76bbca109f4977beaa3ac75671e98db69a295bd4b711226187a3d79",
+    "b1": "9697c488a6e49b1614cbff3d10872cfeb5299a05ddba302da61ab6058fcc128b",
+    "b2": "bf4dedcfbbac2e760bc2c7f5f05dfabd0a9a881ebec4126d81d81be1ca136383",
+    "b3": "ddf23b41e06bc30fd37ada1dd8c4905b13d40c897760af1213e8ac4dee4e4730",
+    "b4": "41fbe72e97a5092a8ba54a9ba92795b303d7dd00d98412aa7a0c11705525a62c",
+    "b5": "8af1afd4400d39d6b1d31572abb6abe02d6829423afb83d32672a01ae09dba41",
 }
 
 

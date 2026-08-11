@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from ceed_core.config import load_overlay, merge_overlays
+from ceed_data.manifest import with_corpus_fingerprint
 from ceed_student.signals import build_signals, signal_artefact_kinds
 from ceed_student.training import resume_key
 
@@ -92,6 +93,7 @@ def resolve_config(args: argparse.Namespace) -> GroupConfig:
         merged["param_efficiency"] = args.param_efficiency
     if args.steps is not None and merged.get("training") is not None:
         merged["training"] = {**merged["training"], "steps": args.steps}
+    merged = with_corpus_fingerprint(merged, args.corpus)
     return GroupConfig.model_validate(merged)
 
 

@@ -3,6 +3,13 @@
 # fp16-on-Volta stability is exercised (do the DocVQA path first).
 group_code: B0
 param_efficiency: full
+# B0 trains nothing, but it is still scored *on a corpus*, and its record is
+# still written to runs/<config_hash>. Without a corpus block its identity would
+# not move when the corpus does, and re-scoring the shipped Student on a
+# different corpus would overwrite the previous number in place.
+corpus:
+  name: ceed-vqa
+  splits: [validation]
 auxiliary_signals: []
 evaluation:
   datasets: [docvqa, gqa, chartqa]
