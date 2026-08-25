@@ -23,7 +23,7 @@ the same convention the teacher-side extraction uses.
 from __future__ import annotations
 
 import io
-from collections.abc import Callable, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,10 @@ from ceed_student.training import TrainingBatch
 # from ceed_teacher so that training never depends on the teacher package.
 TOP_K_LOGIT_IDS = "top_k_logit_ids"
 TOP_K_LOGIT_VALUES = "top_k_logit_values"
+
+# Sentinel for "derive the terminator from the processor", so that passing None
+# explicitly means "this template has none" rather than "work it out".
+_UNSET: Any = object()
 
 
 def answer_text(example: Example) -> str:
@@ -90,25 +94,93 @@ def load_image(image_store: ImageStore, example: Example) -> Any:
     return Image.open(io.BytesIO(image_store.get(example.image_fingerprint))).convert("RGB")
 
 
+def turn_terminator_id(processor: Any) -> int | None:
+    """Return the token that ends an assistant turn, read off the chat template.
+
+    Derived rather than hardcoded: render a one-word assistant turn, diff it
+    against the same turn's generation prompt, and take the first token of the
+    remainder that the model would stop on. On gemma-4 that is ``<turn|>``; on
+    another Student it will be whatever that Student's template uses.
+
+    Args:
+        processor: The Student's processor.
+
+    Returns:
+        The terminator's token id, or ``None`` if the template appends nothing
+        after the assistant's own text.
+    """
+    tokenizer = processor.tokenizer
+    probe = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    full = tokenizer.apply_chat_template(probe, tokenize=True, return_dict=True)["input_ids"]
+    prompt = tokenizer.apply_chat_template(
+        probe[:1], tokenize=True, add_generation_prompt=True, return_dict=True
+    )["input_ids"]
+    common = 0
+    while common < min(len(prompt), len(full)) and prompt[common] == full[common]:
+        common += 1
+    # The answer's own tokens come first; the terminator is the first token after
+    # them that generation would halt on.
+    stops = set(getattr(tokenizer, "all_special_ids", []) or [])
+    for token in full[common:]:
+        if token in stops:
+            return int(token)
+    return None
+
+
+def answer_target_ids(processor: Any, example: Example, terminator: int | None) -> list[int]:
+    """Return the tokens a Group supervises for one example: the answer, then stop.
+
+    **The terminator is supervised, and this is load-bearing.** Training on the
+    answer's tokens alone teaches the Student what to say and never teaches it to
+    stop saying it. Measured: B1 — supervised fine-tuning with no teacher — drove
+    its cross-entropy to 0.13 over 3.7 epochs and its DocVQA score to 0.32, by
+    emitting the correct answer and then continuing to transcribe the page. The
+    distilling Groups were shielded by the teacher's distribution acting as a
+    regulariser, which is the only reason the defect looked like a B1 problem
+    rather than a corpus-wide one.
+
+    Args:
+        processor: The Student's processor.
+        example: The example to supervise.
+        terminator: The turn terminator from :func:`turn_terminator_id`, or
+            ``None`` for a template that has none.
+
+    Returns:
+        The supervised token ids, in order.
+    """
+    ids = list(processor.tokenizer(answer_text(example), add_special_tokens=False)["input_ids"])
+    if terminator is not None:
+        ids.append(terminator)
+    return ids
+
+
 def encode_example(
-    processor: Any, example: Example, image_store: ImageStore
+    processor: Any,
+    example: Example,
+    image_store: ImageStore,
+    terminator: int | None = _UNSET,
 ) -> tuple[dict[str, torch.Tensor], int, torch.Tensor]:
     """Tokenise one example into Student inputs plus its answer-token targets.
 
     The prompt is rendered through the Student's chat template with the
-    generation prompt appended, then the gold answer's tokens are concatenated —
-    this is teacher forcing, and it makes the Student's targets exactly the gold
-    answer tokens (ADR-0002).
+    generation prompt appended, then the supervised answer tokens are
+    concatenated — this is teacher forcing, and it makes the Student's targets
+    exactly the gold answer plus the token that ends the turn (ADR-0002).
 
     Args:
         processor: The Student's processor.
         example: The example to encode.
         image_store: Where the example's image bytes live.
+        terminator: The turn terminator, resolved from the processor when not
+            supplied. Callers encoding a corpus pass it once rather than
+            re-deriving it per example.
 
     Returns:
-        The Student inputs, the prompt length in tokens, and the gold answer's
-        token ids.
+        The Student inputs, the prompt length in tokens, and the supervised
+        answer token ids.
     """
+    if terminator is _UNSET:
+        terminator = turn_terminator_id(processor)
     image = load_image(image_store, example)
     prompt = processor.apply_chat_template(
         chat_messages(example, image),
@@ -119,8 +191,7 @@ def encode_example(
     )
     prompt_ids = prompt["input_ids"][0]
     answer_ids = torch.tensor(
-        processor.tokenizer(answer_text(example), add_special_tokens=False)["input_ids"],
-        dtype=prompt_ids.dtype,
+        answer_target_ids(processor, example, terminator), dtype=prompt_ids.dtype
     )
 
     inputs = dict(prompt)
@@ -130,14 +201,14 @@ def encode_example(
     return inputs, int(prompt_ids.shape[0]), answer_ids
 
 
-def teacher_topk_for(
-    store: ArtifactStore, example_id: str, n_answer_tokens: int
+def topk_from(
+    rows: Mapping[str, np.ndarray], example_id: str, n_answer_tokens: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read one example's cached teacher top-k logits, in answer-token order.
+    """Return one example's cached teacher top-k logits, in answer-token order.
 
     Args:
-        store: The artifact store to read from.
-        example_id: The example whose artefacts to read.
+        rows: The example's artefacts, as read in bulk from the store.
+        example_id: The example, for the error message.
         n_answer_tokens: How many answer tokens the Student encoded.
 
     Returns:
@@ -146,17 +217,41 @@ def teacher_topk_for(
     Raises:
         ValueError: If the store holds a different number of answer tokens for
             this example than the Student encoded — a tokenisation mismatch that
-            would silently misalign supervision.
+            would silently misalign every token's supervision after the first.
     """
-    ids = []
-    values = []
-    for ordinal in range(n_answer_tokens):
-        ids.append(store.vector(example_id, ordinal, TOP_K_LOGIT_IDS))
-        values.append(store.vector(example_id, ordinal, TOP_K_LOGIT_VALUES))
+    ids = rows.get(TOP_K_LOGIT_IDS)
+    if ids is None:
+        raise ValueError(
+            f"the store holds no rows for {example_id!r}; it was built from a "
+            "different corpus, or extraction has not covered this example"
+        )
+    if ids.shape[0] != n_answer_tokens:
+        raise ValueError(
+            f"the store holds {ids.shape[0]} answer tokens for {example_id!r} but the "
+            f"Student encoded {n_answer_tokens}; the two were built from different "
+            "prompts or tokenizers, and training would misalign supervision"
+        )
     return (
-        torch.from_numpy(np.stack(ids).astype(np.int64)),
-        torch.from_numpy(np.stack(values).astype(np.float32)),
+        torch.from_numpy(ids.astype(np.int64)),
+        torch.from_numpy(rows[TOP_K_LOGIT_VALUES].astype(np.float32)),
     )
+
+
+def artefacts_from(rows: Mapping[str, np.ndarray], kinds: Sequence[str]) -> dict[str, torch.Tensor]:
+    """Return the auxiliary artefacts a Group's signals read, as tensors.
+
+    Half-precision artefacts are widened to float32: the loss is computed in the
+    Student's compute dtype, and a half-precision target would cap the precision
+    of every comparison against it.
+
+    Args:
+        rows: The example's artefacts, as read in bulk from the store.
+        kinds: The artefact kinds the Group's signals declared.
+
+    Returns:
+        Each kind as ``[answer_tokens, ...]``, keyed by kind.
+    """
+    return {kind: torch.from_numpy(rows[kind].astype(np.float32)) for kind in kinds}
 
 
 def placeholder_topk(answer_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -172,63 +267,188 @@ def placeholder_topk(answer_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return ids, torch.zeros_like(ids, dtype=torch.float32)
 
 
+class EncodedCorpus(Sequence[TrainingBatch]):
+    """The training corpus as batches, encoded when the loop asks for one.
+
+    Encoding every example up front is what a small corpus lets you get away
+    with. It does not survive this one: a page's ``pixel_values`` alone is 7.7 MB,
+    so 4,282 examples is tens of gigabytes per process, and four Groups training
+    in parallel took the host's OOM killer with them at 61 GB resident each. The
+    encode is also pure waste at startup — several minutes before a single
+    optimiser step.
+
+    So an example is encoded when it is indexed and released when the step ends.
+    The teacher's cached artefacts *are* held: they are read in one query (a
+    per-cell read costs hours) and come to well under a gigabyte for the whole
+    corpus, which is the part worth keeping.
+
+    Re-encoding costs roughly 0.13 s per example against 0.56 s of training, and
+    buys a memory footprint that does not grow with the corpus — which is what
+    lets the Groups run in parallel at all, and what will let GQA and ChartQA
+    join the corpus without this becoming a problem again.
+    """
+
+    def __init__(
+        self,
+        processor: Any,
+        examples: Sequence[Example],
+        image_store: ImageStore,
+        cached: Mapping[str, Mapping[str, np.ndarray]],
+        artefact_kinds: Sequence[str] = (),
+    ) -> None:
+        """Hold what is cheap to keep and defer what is not.
+
+        Args:
+            processor: The Student's processor.
+            examples: The training examples, already split and ordered.
+            image_store: Where example images live.
+            cached: The teacher's artefacts, keyed by example then kind; empty
+                for a teacher-free Group.
+            artefact_kinds: The kinds this Group's auxiliary signals read.
+        """
+        self.processor = processor
+        self.examples = list(examples)
+        self.image_store = image_store
+        self.cached = cached
+        self.artefact_kinds = list(artefact_kinds)
+        # Resolved once: it is a property of the template, not of an example.
+        self.terminator = turn_terminator_id(processor)
+
+    def __len__(self) -> int:
+        """The number of training examples."""
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> TrainingBatch:  # type: ignore[override]
+        """Encode one example into a batch, pairing it with the teacher's cache."""
+        example = self.examples[index]
+        inputs, prompt_length, answer_ids = encode_example(
+            self.processor, example, self.image_store, self.terminator
+        )
+        n_answer = int(answer_ids.shape[0])
+        # Answer token t is predicted at position t-1; the first answer token is
+        # predicted at the prompt's final position.
+        positions = torch.arange(prompt_length - 1, prompt_length - 1 + n_answer)
+
+        artefacts: dict[str, torch.Tensor] = {}
+        if not self.cached:
+            topk_ids, topk_values = placeholder_topk(answer_ids)
+        else:
+            rows = self.cached.get(example.example_id, {})
+            topk_ids, topk_values = topk_from(rows, example.example_id, n_answer)
+            artefacts = artefacts_from(rows, self.artefact_kinds)
+
+        return TrainingBatch(
+            student_inputs=inputs,
+            answer_token_positions=positions,
+            gold_token_ids=answer_ids.to(torch.long),
+            teacher_topk_ids=topk_ids,
+            teacher_topk_values=topk_values,
+            artefacts=artefacts,
+        )
+
+
 def build_batches(
     processor: Any,
     examples: Sequence[Example],
     image_store: ImageStore,
     store: ArtifactStore | None,
     kd_weight: float,
-    progress: Callable[[int, int], None] | None = None,
-) -> list[TrainingBatch]:
-    """Build one training batch per example, pairing it with the teacher's cache.
+    artefact_kinds: Sequence[str] = (),
+) -> EncodedCorpus:
+    """Return the Group's training corpus, ready to be indexed a batch at a time.
+
+    The teacher's cached rows are read here, in one query, and checked against
+    the corpus before training starts: an example the store never covered, or one
+    whose answer tokenises to a different length than extraction recorded, is a
+    misalignment that must surface now rather than as a quietly wrong number.
 
     Args:
         processor: The Student's processor.
         examples: The training examples, already split and ordered.
         image_store: Where example images live.
-        store: The artifact store holding the teacher's top-k logits, or ``None``
+        store: The artifact store holding the teacher's cached rows, or ``None``
             for a teacher-free Group (B1).
         kd_weight: The Group's distillation weight, used to refuse a teacher-free
             build for a Group that actually distils.
-        progress: Optional callback invoked with ``(done, total)``.
+        artefact_kinds: The further artefact kinds the Group's auxiliary signals
+            declared.
 
     Returns:
-        One :class:`~ceed_student.training.TrainingBatch` per example.
+        The corpus as an indexable sequence of batches.
 
     Raises:
-        ValueError: If ``store`` is ``None`` while ``kd_weight`` is non-zero.
+        ValueError: If ``store`` is ``None`` while the Group needs one, either to
+            distil or to feed an auxiliary signal.
     """
     if store is None and kd_weight != 0.0:
         raise ValueError(
             "a Group with kd_weight != 0 distils from the teacher and needs an "
             "artifact store; run teacher extraction first"
         )
-
-    batches: list[TrainingBatch] = []
-    for index, example in enumerate(examples):
-        inputs, prompt_length, answer_ids = encode_example(processor, example, image_store)
-        n_answer = int(answer_ids.shape[0])
-        if n_answer == 0:
-            continue
-        # Answer token t is predicted at position t-1; the first answer token is
-        # predicted at the prompt's final position.
-        positions = torch.arange(prompt_length - 1, prompt_length - 1 + n_answer)
-        if store is None:
-            topk_ids, topk_values = placeholder_topk(answer_ids)
-        else:
-            topk_ids, topk_values = teacher_topk_for(store, example.example_id, n_answer)
-        batches.append(
-            TrainingBatch(
-                student_inputs=inputs,
-                answer_token_positions=positions,
-                gold_token_ids=answer_ids.to(torch.long),
-                teacher_topk_ids=topk_ids,
-                teacher_topk_values=topk_values,
-            )
+    if store is None and artefact_kinds:
+        raise ValueError(
+            f"this Group's auxiliary signals read {sorted(artefact_kinds)} from the "
+            "artifact store, but no store was supplied; run teacher extraction first"
         )
-        if progress is not None:
-            progress(index + 1, len(examples))
-    return batches
+
+    # Every cached row this Group needs, in one query. Read a cell at a time and
+    # each call scans the whole shard glob, so a corpus-sized dataloader spends
+    # longer assembling batches than training on them.
+    cached: dict[str, dict[str, np.ndarray]] = {}
+    if store is not None:
+        wanted = [TOP_K_LOGIT_IDS, TOP_K_LOGIT_VALUES, *artefact_kinds]
+        cached = store.vectors_by_example(wanted, [e.example_id for e in examples])
+        verify_alignment(processor, examples, cached)
+
+    return EncodedCorpus(processor, examples, image_store, cached, artefact_kinds)
+
+
+def verify_alignment(
+    processor: Any,
+    examples: Sequence[Example],
+    cached: Mapping[str, Mapping[str, np.ndarray]],
+) -> None:
+    """Check the store covers the corpus, token for token, before training starts.
+
+    Encoding is lazy, so without this the first disagreement would surface at the
+    step that happens to reach it — hours in, on a Group that has already written
+    checkpoints. The check needs only the answer's tokens, not its image, so it
+    costs a text tokenisation per example and runs over the whole corpus up front.
+
+    Args:
+        processor: The Student's processor.
+        examples: The training examples.
+        cached: The teacher's rows, keyed by example then kind.
+
+    Raises:
+        ValueError: If the store covers no rows for an example, or holds a
+            different number of answer tokens than the Student will encode.
+    """
+    terminator = turn_terminator_id(processor)
+    missing: list[str] = []
+    mismatched: list[str] = []
+    for example in examples:
+        rows = cached.get(example.example_id)
+        if not rows:
+            missing.append(example.example_id)
+            continue
+        n_answer = len(answer_target_ids(processor, example, terminator))
+        held = int(rows[TOP_K_LOGIT_IDS].shape[0])
+        if held != n_answer:
+            mismatched.append(f"{example.example_id} (store {held}, Student {n_answer})")
+    if missing:
+        raise ValueError(
+            f"the store holds no rows for {len(missing)} of {len(examples)} training "
+            f"examples, starting with {missing[0]!r}; it was built from a different "
+            "corpus, or extraction did not finish"
+        )
+    if mismatched:
+        raise ValueError(
+            f"{len(mismatched)} example(s) tokenise to a different number of answer "
+            f"tokens than the store holds, starting with {mismatched[0]}; the two were "
+            "built from different prompts or tokenizers, and training would misalign "
+            "supervision"
+        )
 
 
 def load_corpus_split(

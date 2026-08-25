@@ -26,19 +26,27 @@ from ceed_student import (
 
 
 class _FakeSignal:
-    """A stand-in auxiliary signal declaring its requirements without a loss."""
+    """A stand-in auxiliary signal: declared requirements and a fixed per-token loss."""
 
-    def __init__(self, name, kinds, views, weight=1.0):
+    def __init__(self, name, kinds, views, weight=1.0, layers=(), loss=None):
         self.name = name
         self.weight = weight
         self._kinds = frozenset(kinds)
         self._views = frozenset(views)
+        self._layers = frozenset(layers)
+        self._loss = loss
 
     def required_kinds(self):
         return self._kinds
 
     def required_views(self):
         return self._views
+
+    def required_student_layers(self):
+        return self._layers
+
+    def token_loss(self, context):
+        return self._loss
 
 
 # -- requirement aggregation -------------------------------------------------

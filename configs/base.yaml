@@ -4,13 +4,17 @@ seed: 0
 param_efficiency: lora
 
 layer_mapping:
+  # The placeholder that unblocks B3 and B5 until the probe-based mapping study
+  # replaces it. These pairs are exactly
+  #   ceed_core.proportional_mapping((9, 19, 29), 30, 42)
+  # -- floor(layer * 42 / 30), the same relative depth in a 30-layer Teacher and a
+  # 42-layer Student -- and tests/test_layer_mapping.py asserts that, so the
+  # config cannot drift away from the rule it claims to follow.
   kind: proportional
-  # (teacher_layer, student_layer) pairs. Proportional placeholder that unblocks
-  # B3 until the probe-based mapping study concludes.
   pairs:
     - [9, 12]
     - [19, 26]
-    - [29, 39]
+    - [29, 40]
 
 extraction:
   # The Hugging Face repo id, lowercase as the hub and the local cache hold it.
@@ -20,3 +24,8 @@ extraction:
   ablation: mean-of-active
   combine_weight: effective
   thinking_enabled: false
+  # The supervised span is the gold answer *plus* the token that ends the turn.
+  # Training on the answer alone teaches the Student what to say and never when
+  # to stop: B1 reached a training cross-entropy of 0.13 and a DocVQA score of
+  # 0.32 by answering correctly and then transcribing the rest of the page.
+  answer_span: gold+turn_end

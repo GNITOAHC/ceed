@@ -142,5 +142,5 @@ def test_an_unknown_param_efficiency_mode_is_rejected():
 
 
 def test_an_unknown_layer_mapping_kind_is_rejected():
-    with pytest.raises(ValidationError, match="mapping kind"):
+    with pytest.raises(ValidationError, match="diagonal"):
         LayerMapping(kind="diagonal", pairs=((0, 0),))

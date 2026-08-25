@@ -174,3 +174,32 @@ def test_storing_the_same_image_twice_is_idempotent(tmp_path):
     store = ImageStore(tmp_path)
     data = b"same bytes"
     assert store.put(data) == store.put(data)
+
+
+# -- GQA's answer region is optional ----------------------------------------
+#
+# lmms-lab/GQA serves the questions without the scene graph, so the answer-linked
+# box is genuinely absent from the source. Requiring it forced the loader either
+# to fabricate a box or to fail, and it failed silently for months.
+
+
+def test_a_gqa_example_can_be_built_without_an_answer_region():
+    example = make_gqa_example(
+        source_id="g9",
+        question="What colour is the car?",
+        answers=["red"],
+        image_fingerprint="fp",
+    )
+    assert example.answer_region is None
+
+
+def test_a_gqa_example_without_a_region_is_still_intervention_eligible():
+    # Eligibility is a property of the dataset, not of whether this particular
+    # source happened to ship the box.
+    example = make_gqa_example(source_id="g9", question="q", answers=["a"], image_fingerprint="fp")
+    assert example.intervention_eligible
+
+
+def test_a_gqa_example_still_carries_a_region_when_one_is_given():
+    example = a_gqa_example()
+    assert example.answer_region == BoundingBox(x=0.3, y=0.3, width=0.2, height=0.2)

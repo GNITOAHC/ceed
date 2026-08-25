@@ -1,28 +1,51 @@
-# Running and evaluating B0, B1, and B2
+# Running and evaluating the baseline Groups, B0 to B5
 
-This is the operational guide for the three baseline Groups. Everything runs
+This is the operational guide for the six baseline Groups. Everything runs
 through `uv` from the repository root.
 
-| Group | What it is | Trains? | Needs the Teacher? |
+| Group | What it is | Trains? | Teacher artefacts it reads |
 | --- | --- | --- | --- |
-| **B0** | The Student as it ships, zero-shot | no | no |
-| **B1** | Supervised fine-tuning on gold answers (`kd_weight: 0`) | yes | no |
-| **B2** | The primary baseline: cross-entropy **+ top-k logit distillation** | yes | **yes** |
+| **B0** | The Student as it ships, zero-shot | no | none |
+| **B1** | Supervised fine-tuning on gold answers (`kd_weight: 0`) | yes | none |
+| **B2** | The primary baseline: cross-entropy **+ top-k logit distillation** | yes | `top_k_logit_*` |
+| **B3** | B2 **+ hidden-state projection distillation** | yes | `+ hidden_states` |
+| **B4** | B2 **+ VA-OPD's visual-advantage reweighting** | yes | `+ visual_advantage` |
+| **B5** | B2 **+ router combine-weight probing** | yes | `+ combine_weights` |
 
 Every experimental Group later in the plan is B2 plus one or more auxiliary
-signals, so B2 is the number they are all measured against, and B1 is the
-no-teacher control that says how much of B2's gain is distillation rather than
-fine-tuning.
+signals, so B2 is the number they are all measured against; B1 is the no-teacher
+control that says how much of B2's gain is distillation rather than fine-tuning;
+and B3 to B5 are the three published-alternative comparators.
 
-## The three scripts
+**B3, B4 and B5 differ from B2 in their auxiliary signal and in nothing else** —
+same corpus, same backbone weighting, same step budget, same decoding, same layer
+mapping. That is asserted in `tests/test_b3_b4_b5.py` rather than maintained by
+hand, because an accidental asymmetry would produce a plausible wrong number
+rather than a failure.
+
+## The scripts
 
 ```
-scripts/build_corpus.py           # once: assemble the shared corpus
-scripts/extract_teacher_logits.py # once per corpus: cache what B2 distils from
-scripts/run_group.py              # per Group: train (if it trains) and score
-scripts/infer.py                  # after a run: load the trained Student and query it
-scripts/merge_adapter.py          # optional: fold the adapter into a standalone model
+scripts/build_corpus.py              # once: assemble the shared corpus
+scripts/extract_teacher_artifacts.py # once per corpus: cache what B2-B5 read
+scripts/run_group.py                 # per Group: train (if it trains) and score
+scripts/run_baselines.sh             # all six Groups in order, resumable
+scripts/infer.py                     # after a run: load the trained Student and query it
+scripts/merge_adapter.py             # optional: fold the adapter into a standalone model
 ```
+
+The whole set, once the corpus and store exist:
+
+```bash
+scripts/run_baselines.sh data/corpus data/store-full runs logs [steps]
+```
+
+One Group per GPU — the Student is 8B in fp16 and fits on a single V100 alongside
+a document-length sequence — so the six Groups run in four lanes rather than in
+sequence. It is resumable in the strong sense: a Group that has reached its step
+budget is skipped rather than retrained, and a Group killed halfway continues
+from its last checkpoint. Re-running the script after a preemption is the
+recovery.
 
 ---
 
@@ -38,8 +61,38 @@ uv run python scripts/build_corpus.py --output data/corpus --limit 200
 
 - `--limit` is **per dataset**, and **zero or negative means the whole source
   split**. Start small: the sources are gigabytes.
+- `--dataset-limit gqa=5000` overrides `--limit` for one dataset. The three
+  sources differ by three orders of magnitude, so one cap rarely suits all of
+  them.
 - `--datasets docvqa gqa chartqa` selects sources (all three by default).
 - Splits are fixed at 80/10/10 train/validation/test, seeded by `--seed`.
+- **A requested dataset that yields nothing fails the build.** Previously it was
+  warned about and dropped, which meant asking for three datasets and silently
+  getting one. `--allow-partial` restores the old behaviour when you mean it.
+
+### Which source split each dataset comes from
+
+These are the splits the published sources actually serve, which is not what
+their papers name:
+
+| Dataset | Source | Config | Split | Size |
+| --- | --- | --- | --- | --- |
+| DocVQA | `lmms-lab/DocVQA` | `DocVQA` | `validation` | ~5.3k questions |
+| GQA | `lmms-lab/GQA` | `{split}_balanced_instructions` **joined to** `{split}_balanced_images` | `train` | ~943k questions |
+| ChartQA | `lmms-lab/ChartQA` | `default` | `test` | ~2.5k questions |
+
+DocVQA withholds its test answers, so validation is the usable split. ChartQA
+publishes only `test`. CEED's own 80/10/10 re-split applies on top of whichever
+split it drew from, so CEED's `test` is held out from CEED regardless.
+
+**GQA is a join, not a stream.** Its questions and its images are in separate
+configs — the instructions config is text only, carrying an `imageId`. The loader
+takes a prefix of the images, then keeps the questions whose image it holds. The
+other direction reads all ~72k images to satisfy a few thousand questions. One
+consequence worth knowing: GQA examples carry **no `answer_region`**, because the
+answer-linked box lives in the scene-graph release rather than in the question
+rows. Nothing in B0–B5 reads it; Phase 2's region interventions will have to
+supply it.
 
 To take everything a source has:
 
@@ -47,10 +100,21 @@ To take everything a source has:
 uv run python scripts/build_corpus.py --output data/corpus-full --datasets docvqa --limit 0
 ```
 
-Note which source split that is: `build_corpus.py` draws DocVQA from the source
-**validation** split (~5.3k questions), GQA and ChartQA from **train**. "Full
-DocVQA" therefore means that split, not the ~39k DocVQA train split, and the
-80/10/10 re-split applies on top of it.
+Do not do that for GQA. `--limit 0` there means ~943k questions and every image
+behind them.
+
+### Check the sources before you trust a build
+
+The loaders talk to the Hub, so they are out of the fast tier. Run them
+deliberately:
+
+```bash
+uv run pytest -m slow tests/test_loaders_live.py
+```
+
+That is what says the sources still serve the fields the loaders read. Two of the
+three loaders were broken against the live Hub for a long time precisely because
+nothing exercised them.
 
 Produces:
 
@@ -61,21 +125,103 @@ data/corpus/
   images/                 # images addressed by content hash
 ```
 
-If a source fails (gated repo, renamed dataset) the script warns and continues
-with the rest, so one broken source does not cost you the others.
+### The corpus is part of a run's identity
 
-## Step 2 — Cache the Teacher's logits (only for B2)
+`corpus_manifest.json` hashes to a **corpus fingerprint** — a content hash of
+exactly which example ids landed in which split — and every entry point fills it
+into the Group's `corpus.fingerprint` before the run hash is computed.
 
-B2's backbone needs the Teacher's **top-k next-token logits at each gold answer
-token**. That is an ordinary teacher-forced forward pass — it needs none of the
-MoE hooking (router internals, expert ablation) the Causal Expert Attribution
-work requires, which is why the primary baseline is runnable now.
+This is not bookkeeping. `CorpusConfig.name` is the constant `ceed-vqa` in every
+Group's overlay, so without the fingerprint a Group trained on DocVQA alone and
+the same Group trained on all three datasets hash **identically**, and the
+consequences are silent rather than loud:
+
+- `runs/<hash>/run_record.json` is overwritten, so the first result is replaced
+  by the second under a hash claiming to describe both;
+- the checkpoint directory is keyed by the resume key, which is that same hash
+  with the step budget normalised away — so the second run finds a
+  `progress.json` written by a matching configuration, adopts it, and, being
+  already at its step budget, **trains zero steps** before being scored on the
+  new corpus and reported as a new result.
+
+The resume guard cannot catch that on its own: it compares configurations, and
+the configurations really are identical. The corpus is what differs. Changing the
+corpus now changes the hash, so the two runs cannot collide.
+
+A corpus directory with no manifest — the synthetic ones the fast tier builds —
+contributes no fingerprint, and those Groups hash as they always did.
+
+### Building the three-dataset corpus
+
+The DocVQA-only corpus is the one the published baselines used. To train on
+everything CEED supports:
 
 ```bash
-uv run python scripts/extract_teacher_logits.py \
+uv run python scripts/build_corpus.py \
+    --output data/corpus-all \
+    --datasets docvqa gqa chartqa \
+    --limit 0 \
+    --dataset-limit gqa=5000 \
+    --seed 0
+```
+
+`--limit 0` takes DocVQA and ChartQA whole; the override keeps GQA to a
+comparable share instead of the ~943k questions it would otherwise contribute.
+Roughly:
+
+| Dataset | Examples | Metric it is scored under |
+| --- | --- | --- |
+| DocVQA | ~5,350 | ANLS |
+| GQA | 5,000 | exact match |
+| ChartQA | ~2,500 | relaxed accuracy |
+| | **~12,850** → train ~10,280 / validation ~1,285 / test ~1,285 | |
+
+Two things follow from mixing sources that did not matter with one:
+
+- **The split is not stratified.** 80/10/10 is applied to the pooled corpus, so
+  each split's dataset mix is what chance gives it. With thousands per dataset
+  that is close enough to proportional; check `dataset_counts` in the manifest
+  and the per-dataset `n` in the run record rather than assuming.
+- **The evaluator reports one metric per dataset**, and there is no aggregate.
+  A run record on this corpus carries `docvqa`, `gqa` and `chartqa` separately —
+  which is correct, because ANLS and relaxed accuracy do not average into
+  anything meaningful.
+
+## Step 2 — Cache the Teacher's artefacts (for B2 and above)
+
+The artifact store is the single seam between teacher measurement and student
+training: the Teacher is **never loaded during training**, so everything a Group's
+objective needs is measured once here.
+
+```bash
+# B2 only: the top-k logits its backbone distils from
+uv run python scripts/extract_teacher_artifacts.py \
     --corpus data/corpus --store data/store \
     --group b2 --split train --top-k 64
+
+# everything B2 through B5 need, in one pass
+uv run python scripts/extract_teacher_artifacts.py \
+    --corpus data/corpus --store data/store-full \
+    --group b2 --split train --top-k 64 --all
 ```
+
+What `--all` adds, and what each costs:
+
+| Flag | Artefact | For | Cost |
+| --- | --- | --- | --- |
+| `--with-hidden-states` | residual state at 6 candidate layers | B3 | ~34 KB per answer token |
+| `--with-combine-weights` | effective combine weight, all 30 layers | B5 | ~8 KB per answer token |
+| `--with-visual-advantage` | per-token visual advantage | B4 | **a second forward per example** |
+
+None of this is the Causal Expert Attribution extraction, which needs the hooked
+forward that can ablate an expert and re-run the tail. Combine weights are a
+byproduct of the ordinary forward — which is exactly why B5 ships with the
+baselines and the CEA Groups do not.
+
+> **A store's schema is fixed when it is created.** Adding an artefact kind to an
+> existing store is refused, because rows already written do not have the column.
+> If you extracted for B2 and now want B3 to B5, extract into a **new** `--store`
+> directory with `--all`. The B2 store stays valid and B2 is not retrained.
 
 - The 26B Teacher is sharded across GPUs by `--device-map auto`. On the 4×V100
   box it needs all four cards.
@@ -101,7 +247,44 @@ uv run python scripts/run_group.py --group b1 --steps 2000 --limit 100
 
 # B2 — the primary baseline (needs step 2 to have run)
 uv run python scripts/run_group.py --group b2 --steps 2000 --limit 100
+
+# B3, B4, B5 — each needs the store its signal reads, so extract with --all
+uv run python scripts/run_group.py --group b3 --store data/store-full --steps 2000 --limit 100
+uv run python scripts/run_group.py --group b4 --store data/store-full --steps 2000 --limit 100
+uv run python scripts/run_group.py --group b5 --store data/store-full --steps 2000 --limit 100
 ```
+
+A Group whose signal reads an artefact the store never cached refuses to start,
+naming the missing kind — the check happens before the Student is loaded, not at
+hour six.
+
+### How much training a Group actually does
+
+`steps` is **optimiser steps**, and each one consumes `batch_size` examples by
+gradient accumulation: the Student sees one example's activations at a time (it
+is 8B, and a page is thousands of visual tokens) while the gradient is the mean
+over the batch. So the training set is walked
+
+    steps x batch_size / |train split|   times,
+
+which at the checked-in `2000 x 8` over the 4,282-example DocVQA-only train split
+is **~3.7 epochs**. The run record carries `train.epochs` so this is read off the
+record rather than recomputed — and the metrics log carries `examples_seen`
+beside it.
+
+**The budget does not follow the corpus.** Enlarging the corpus without raising
+`steps` buys fewer passes over it, not more training, so a Group on a corpus
+2.4x the size at the same budget sees each example 1.6 times rather than 3.7.
+Decide which you are holding fixed — examples seen, or passes over the corpus —
+and say which in the write-up, because a Group compared against a baseline that
+held the other one fixed is not a comparison. `scripts/run_baselines.sh` takes
+the budget as its fifth argument for exactly this.
+
+The corpus is **shuffled once per epoch**, deterministically from the Group's
+seed. Two Groups at the same seed therefore walk it in the same order, which is
+what keeps their difference the auxiliary signal rather than the shuffle; and the
+order is a pure function of the global position, so a preempted run resumes the
+same walk instead of restarting the epoch.
 
 Useful flags:
 
@@ -121,13 +304,14 @@ defaults to no cap. The corpus's own size is fixed earlier, by step 1.
 
 Two things about the step budget, as the loop currently stands:
 
-- **One step consumes one example.** `--steps` is therefore a count of examples
-  seen, not of batches: seeing a 4,000-example corpus once means `--steps 4000`.
-  The `batch_size` field in the Group's YAML is not yet read by the training
-  loop.
-- **Batches are encoded up front and held in memory** — roughly 8 MB per example
-  on DocVQA, dominated by pixel values. A few thousand examples is tens of GB
-  resident, and the encoding pass before training starts is not quick.
+- **One step consumes `batch_size` examples**, by gradient accumulation — the
+  Student sees one example's activations at a time and the optimiser steps on the
+  mean of eight. So `--steps` counts optimiser steps, not examples: walking a
+  4,282-example corpus once at `batch_size: 8` is `--steps 536`.
+- **Examples are encoded on demand, not up front.** `build_batches` reads every
+  cached teacher row in one query and returns a lazy corpus that encodes an
+  example when the loop indexes it. Encoding eagerly cost ~8 MB per example in
+  pixel values and took the host past its memory with four lanes running.
 
 What the script builds is decided by the Group's config, not by flags: a Group
 with no `training:` block never constructs a trainer, and a Group whose
@@ -141,12 +325,28 @@ runs/
   <config_hash>/
     run_record.json    # the durable statement of what this run was
     metrics.jsonl      # the event stream; disk is the source of truth
-  checkpoints/<group>/checkpoint/   # accelerate state + the LoRA adapter
+  checkpoints/<group>-<key>/checkpoint/          # accelerate state + the LoRA adapter
+  checkpoints/<group>-<key>/checkpoint/probes/   # B3/B5 only: the discarded probes
 ```
 
 `run_record.json` carries the group, seed, **parameter-efficiency mode actually
 trained**, layer mapping, both config hashes, the metrics, and the checkpoint
-path.
+path. For a Group with an auxiliary signal it also carries a
+`train.aux.<signal_name>` metric, so a row in the Phase 1 table states its own
+independent variable.
+
+**Probes are deletable.** B3's projections and B5's probes are parameters of the
+*signal*, never of the Student, so nothing has to be stripped out afterwards: the
+Student a probing run leaves behind is architecturally identical to the base
+model, and the zero-added-inference-cost claim is literally true. They are written
+to `probes/` beside the checkpoint for analysis, where no server loading the
+adapter can pick them up.
+
+They are not the same size, and that matters when reading the numbers. On the real
+Student, B3's projections are **21.6M** parameters and B5's probes **1.0M**,
+against a rank-4 adapter's 2.3M in the Student itself. B3's projection can absorb
+much of its own matching task, so a B3 null under LoRA is even harder to attribute
+than ADR-0005 already warns.
 
 ---
 
@@ -157,7 +357,7 @@ run writes is an **adapter** — about 9 MB — not a full model; loading it mea
 loading the base Student and applying the adapter on top.
 
 ```
-runs/checkpoints/b1/checkpoint/
+runs/checkpoints/b1-<key>/checkpoint/
   adapter/                  # what inference loads (adapter_model.safetensors + config)
   model.safetensors         # accelerate's state, for *resuming* training
   optimizer.bin
@@ -183,7 +383,7 @@ uv run python scripts/infer.py --run runs/<config_hash> --image page.png \
     --question "What is the total?" --base
 ```
 
-`--checkpoint runs/checkpoints/b1/checkpoint` works too if you would rather name
+`--checkpoint runs/checkpoints/b1-<key>/checkpoint` works too if you would rather name
 the checkpoint directly than go through a run record.
 
 ### From Python
@@ -348,22 +548,44 @@ same 0.7500 mean. The merged model is a true drop-in.
 
 ## Resuming
 
-Training checkpoints and resumes; a preempted Group is restarted with the same
-command. Re-running a Group that already hit its step budget retrains nothing
-and reuses the frozen checkpoint, which is what keeps a baseline from being
-quietly retrained for a later comparison.
+Training checkpoints and resumes, so a multi-day Group survives preemption. A
+Group that has already reached its step budget is **not retrained** — its frozen
+checkpoint is reused, which is what stops a baseline being retrained for every
+later comparison.
 
 ```bash
 # ran 4 steps, then asked for 6: runs the 2 remaining
-uv run python scripts/run_group.py --group b2 --steps 6 ...   # steps_run: 2, resumed: true
+uv run python scripts/run_group.py --group b1 --steps 4
+uv run python scripts/run_group.py --group b1 --steps 6
 ```
+
+The checkpoint directory is named `<group>-<key>`, where the key is the run hash
+with the *step budget* normalised away. Everything else about a Group — its
+objective, its signals, its batch size, its layer mapping, its seed — changes what
+training does, so a Group whose configuration changed gets a different directory
+and starts fresh. Raising the budget is the one change that is genuinely a
+continuation, because the example order is a pure function of the global position.
+
+`progress.json` records the configuration that wrote it, and a checkpoint written
+by a different one is **refused** rather than adopted:
+
+```
+the checkpoint here was written by configuration 335406898cb8, but Group B1 is
+31802aeade42. Resuming it would report the older configuration's training under
+this one's name.
+```
+
+That message is worth understanding, because the failure it prevents is silent:
+a completed checkpoint from a superseded configuration would be picked up, train
+zero steps because it is already "complete", and be scored and reported as the
+new Group.
 
 ## How the numbers are produced
 
-All three Groups are scored by the **same** evaluator (`ceed_eval.DirectEvaluator`):
+Every Group is scored by the **same** evaluator (`ceed_eval.DirectEvaluator`):
 the same held-out split, greedy decoding enforced in code (A9), and the metric
 each dataset is reported under — ANLS for DocVQA, exact match for GQA, relaxed
-accuracy for ChartQA. That identity is what makes B0/B1/B2 comparable to each
+accuracy for ChartQA. That identity is what makes B0 to B5 comparable to each
 other.
 
 Two things are deliberate and worth knowing:
@@ -400,7 +622,7 @@ real corpus:
 ```bash
 uv run python scripts/run_group.py --group b0 --corpus <corpus> --limit 3
 uv run python scripts/run_group.py --group b1 --corpus <corpus> --steps 3 --train-limit 4
-uv run python scripts/extract_teacher_logits.py --corpus <corpus> --store <store> \
+uv run python scripts/extract_teacher_artifacts.py --corpus <corpus> --store <store> \
     --group b2 --limit 4 --top-k 32 --skip-correctness
 uv run python scripts/run_group.py --group b2 --corpus <corpus> --store <store> \
     --steps 4 --train-limit 4 --limit 3
@@ -413,8 +635,22 @@ rather than restarting.
 
 ## Troubleshooting
 
-**"Group B2 distils from the Teacher but no artifact store exists at …"** — run
-step 2. The message includes the exact command.
+**"Group B2 reads the Teacher's cached artefacts but no artifact store exists at
+…"** — run step 2. The message includes the exact command, with `--all` if the
+Group needs it.
+
+**"store … is missing artefact kind(s) ['combine_weights']"** — the store was
+extracted without the kind this Group's signal reads. Re-extract into a new
+`--store` directory with `--all`; a store's schema cannot be widened in place.
+
+**"store at … already exists with different metadata"** — you asked for more
+artefact kinds than the store at that path was created with. Same fix: a new
+`--store` directory. The old store stays valid, so Groups already trained against
+it are not invalidated and are not retrained.
+
+**"teacher layer 17 was not cached; this store holds [4, 9, 14, 19, 24, 29]"** —
+`base.yaml`'s `layer_mapping` names a teacher layer the extraction did not cache.
+Either map to a cached layer or re-extract with `--hidden-state-layers`.
 
 **"no row for ('docvqa:q1', 3) in store"** — the Student encoded more answer
 tokens than the store holds for that example. The store was built from a

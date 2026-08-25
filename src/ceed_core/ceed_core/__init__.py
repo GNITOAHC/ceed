@@ -24,9 +24,9 @@ from ceed_core.config import (
     EvaluationConfig,
     ExtractionConfig,
     GroupConfig,
-    LayerMapping,
     ParamEfficiencyMode,
     Phase2Variant,
+    SignalOptions,
     StudentConfig,
     TrainingConfig,
     WarmupConfig,
@@ -34,6 +34,12 @@ from ceed_core.config import (
     extraction_fingerprint,
     resolve_group_config,
     run_hash,
+)
+from ceed_core.layer_mapping import (
+    LayerMapping,
+    MappingKind,
+    mismatched_mapping,
+    proportional_mapping,
 )
 from ceed_core.metrics import MetricsSink, Tracker
 from ceed_core.run_record import RunRecord
@@ -53,11 +59,13 @@ __all__ = [
     "ExtractionConfig",
     "GroupConfig",
     "LayerMapping",
+    "MappingKind",
     "MetricsSink",
     "MissingArtifactKindError",
     "ParamEfficiencyMode",
     "Phase2Variant",
     "RunRecord",
+    "SignalOptions",
     "StoreMetadata",
     "StudentConfig",
     "Tracker",
@@ -66,6 +74,8 @@ __all__ = [
     "WarmupConfig",
     "canonical_json",
     "extraction_fingerprint",
+    "mismatched_mapping",
+    "proportional_mapping",
     "resolve_group_config",
     "run_hash",
     "store_root",

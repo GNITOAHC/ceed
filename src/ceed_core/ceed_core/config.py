@@ -35,6 +35,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ceed_core.layer_mapping import LayerMapping
+
 
 class ParamEfficiencyMode(StrEnum):
     """How a Group's Student parameters are trained.
@@ -60,33 +62,6 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class LayerMapping(_Frozen):
-    """The correspondence between Teacher and Student layers.
-
-    Represented as a first-class object rather than an implicit convention
-    because C2 is defined as a deliberately *mismatched* mapping and Phase 2
-    reports variance across alternatives, so the mapping a run used must be
-    recorded, not inferred.
-
-    Attributes:
-        kind: How the mapping was produced — ``proportional`` (the placeholder
-            that unblocks B3), ``probe`` (the learned replacement), or
-            ``mismatched`` (C2's control).
-        pairs: The ``(teacher_layer, student_layer)`` correspondences.
-    """
-
-    kind: str
-    pairs: tuple[tuple[int, int], ...]
-
-    @field_validator("kind")
-    @classmethod
-    def _known_kind(cls, value: str) -> str:
-        allowed = {"proportional", "probe", "mismatched"}
-        if value not in allowed:
-            raise ValueError(f"layer mapping kind must be one of {sorted(allowed)}, got {value!r}")
-        return value
-
-
 class StudentConfig(_Frozen):
     """The Student checkpoint and the precision it is loaded in.
 
@@ -103,16 +78,26 @@ class CorpusConfig(_Frozen):
     """Which corpus a Group trains and evaluates on.
 
     ``None`` on a :class:`GroupConfig` denotes the null Group, which has no
-    corpus at all. A real corpus is fleshed out in a later ticket; here it only
-    needs to be nameable and hashable.
+    corpus at all.
+
+    The ``name`` is written by hand in the Group YAML and is therefore a label,
+    not evidence. The ``fingerprint`` is the corpus manifest's content hash,
+    filled in by the entry points from the corpus actually on disk, and it is what
+    makes the run hash a statement about what the run trained on. Without it two
+    runs over different corpora hash identically, and the second silently adopts
+    the first's completed checkpoint instead of training.
 
     Attributes:
-        name: The corpus identifier.
+        name: The corpus identifier, as written in the Group's overlay.
         splits: The split names the run draws from.
+        fingerprint: The manifest fingerprint of the corpus actually read, or
+            ``None`` where no corpus directory was resolved (unit tests, the null
+            Group).
     """
 
     name: str
     splits: tuple[str, ...] = ()
+    fingerprint: str | None = None
 
 
 class ExtractionConfig(_Frozen):
@@ -134,6 +119,13 @@ class ExtractionConfig(_Frozen):
         combine_weight: The combine-weight definition (e.g. ``effective``).
         thinking_enabled: Whether the Teacher's thinking gate is on. Disabled
             everywhere in CEED.
+        answer_span: Which tokens count as answer tokens, and therefore which
+            positions the Teacher is measured at and the Student supervised on.
+            ``gold+turn_end`` is the gold answer followed by the token that ends
+            the assistant's turn; ``gold`` is the answer alone. This is part of
+            the fingerprint because it changes how many rows an example has, so a
+            store built under one convention describes different positions from a
+            store built under the other.
     """
 
     teacher_model: str
@@ -142,6 +134,15 @@ class ExtractionConfig(_Frozen):
     ablation: str
     combine_weight: str
     thinking_enabled: bool = False
+    answer_span: str = "gold+turn_end"
+
+    @field_validator("answer_span")
+    @classmethod
+    def _known_span(cls, value: str) -> str:
+        allowed = {"gold", "gold+turn_end"}
+        if value not in allowed:
+            raise ValueError(f"answer_span must be one of {sorted(allowed)}, got {value!r}")
+        return value
 
 
 class BackboneConfig(_Frozen):
@@ -210,21 +211,44 @@ class TrainingConfig(_Frozen):
     warmup: WarmupConfig = WarmupConfig()
 
 
+class SignalOptions(_Frozen):
+    """The tunable constants of the auxiliary signals that have any.
+
+    Typed rather than a free-form mapping, so a mistyped option is a load-time
+    error and every value that moves a reported number is part of the run hash.
+    Each field is read by exactly one signal and ignored by the rest; the
+    defaults reproduce the published settings of the method being reproduced.
+
+    Attributes:
+        va_top_fraction: B4 only. The fraction of answer tokens, ranked by
+            visual advantage, forming the high-VA group (VA-OPD's ``p_v``,
+            published default 0.2).
+        va_high_weight: B4 only. The share of the loss the high-VA group carries
+            (VA-OPD's ``lambda``, published default 0.5).
+    """
+
+    va_top_fraction: float = Field(default=0.2, gt=0.0, le=1.0)
+    va_high_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
 class AuxiliarySignalConfig(_Frozen):
     """One auxiliary supervision signal added on top of the shared backbone.
 
     A Group is the backbone plus zero or more of these; the null Group and B0
-    have none, E4 has three. Later tickets give each signal its artefact-kind
-    requirements and loss; here it only needs a stable name and weight so that
-    Group composition and hashing can be exercised.
+    have none, E4 has three. The name selects the component
+    (:func:`ceed_student.signals.build_signals` resolves it), the weight scales
+    its contribution, and the options carry whatever constants that component
+    reads.
 
     Attributes:
         name: The signal identifier.
         weight: Its scalar loss weight.
+        options: The signal's tunable constants, defaulted per signal.
     """
 
     name: str
     weight: float = 1.0
+    options: SignalOptions = SignalOptions()
 
 
 class DecodingConfig(_Frozen):

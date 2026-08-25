@@ -1,0 +1,42 @@
+# B4: the VA-OPD reproduction — the plan's critical external baseline.
+#
+# The Teacher scored every gold answer token twice, once on the image and once on
+# a 10%-downsampled copy of it; the per-token difference (the visual advantage)
+# is cached. This Group ranks answer tokens by that advantage and redistributes
+# the distillation loss towards the top of the ranking, which is the paper's
+# claim: a small minority of tokens carries the visual supervision.
+#
+# The reproduction is faithful in its degradation, its rectified advantage, and
+# its grouping constants (p_v = 0.2, lambda = 0.5); it is off-policy on gold
+# answers rather than on-policy on student rollouts, which ADR-0007 records and
+# justifies.
+group_code: B4
+corpus:
+  name: ceed-vqa
+  splits: [train]
+auxiliary_signals:
+  - name: visual_advantage_reweighting
+    weight: 1.0
+    options:
+      va_top_fraction: 0.2 # the paper's p_v
+      va_high_weight: 0.5 # the paper's lambda
+training:
+  # 2000 steps x 8 examples = 16,000 examples, ~3.7 passes over the 4,282-example
+  # training split. batch_size is honoured by gradient accumulation, so the
+  # Student sees one example's activations at a time and the gradient is the mean
+  # over eight -- the memory of batch 1 with the gradient noise of batch 8.
+  steps: 2000
+  learning_rate: 1.0e-4
+  batch_size: 8
+  checkpoint_every: 200
+  backbone:
+    kd_weight: 1.0 # identical to B2: only the auxiliary signal differs
+    kd_temperature: 2.0
+  warmup:
+    backbone_only_steps: 0 # the signal carries no parameters, so there is
+    ramp_steps: 0 # nothing untrained to ramp in
+evaluation:
+  datasets: [docvqa, gqa, chartqa]
+  decoding:
+    do_sample: false # greedy, enforced in code regardless (A9)
+    max_new_tokens: 64

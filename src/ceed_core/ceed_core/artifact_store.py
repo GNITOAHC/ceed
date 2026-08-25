@@ -33,7 +33,7 @@ import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 METADATA_FILENAME = "store_metadata.json"
 SHARDS_DIRNAME = "shards"
@@ -62,15 +62,58 @@ class VectorSpec(BaseModel):
     it. They are recorded in the store metadata so a reader needs nothing but the
     store itself.
 
+    Layer-stacked artefacts carry one more thing. Effective combine weights and
+    hidden states are cached at several teacher layers and stacked along the
+    leading axis, and over-caching (ADR-0001) means that axis is *not* the
+    extraction configuration's layer set — it is whatever was cached, which is
+    deliberately wider. ``layers`` names it, so a signal asking for teacher layer
+    19 resolves it against the store rather than against a convention.
+
     Attributes:
         dtype: The numpy dtype name, e.g. ``float16`` or ``int32``.
         shape: The array shape of a single row's value.
+        layers: For a layer-stacked artefact, the teacher layers its leading
+            axis corresponds to, in order; ``None`` for artefacts that are not
+            layer-stacked.
     """
 
     model_config = ConfigDict(frozen=True)
 
     dtype: str
     shape: tuple[int, ...]
+    layers: tuple[int, ...] | None = None
+
+    @model_validator(mode="after")
+    def _layers_match_the_leading_axis(self) -> VectorSpec:
+        if self.layers is not None and (not self.shape or len(self.layers) != self.shape[0]):
+            raise ValueError(
+                f"layers {self.layers} do not index the leading axis of shape {self.shape}"
+            )
+        return self
+
+    def layer_index(self, layer: int) -> int:
+        """Return the leading-axis index a teacher layer sits at.
+
+        Args:
+            layer: The teacher layer to locate.
+
+        Returns:
+            Its index along the artefact's leading axis.
+
+        Raises:
+            MissingArtifactKindError: If the artefact is not layer-stacked, or
+                was not cached at ``layer`` — either way the Group asked for
+                something this store does not hold.
+        """
+        if self.layers is None:
+            raise MissingArtifactKindError(
+                f"this artefact is not layer-stacked, so teacher layer {layer} has no index"
+            )
+        if layer not in self.layers:
+            raise MissingArtifactKindError(
+                f"teacher layer {layer} was not cached; this store holds {list(self.layers)}"
+            )
+        return self.layers.index(layer)
 
     @property
     def itemsize(self) -> int:
@@ -315,6 +358,61 @@ class ArtifactStore:
         A resumed extraction skips these rather than restarting.
         """
         return {row[0] for row in self._read(f"SELECT DISTINCT {EXAMPLE_ID} FROM artifacts")}
+
+    def vectors_by_example(
+        self, kinds: Sequence[str], example_ids: Iterable[str] | None = None
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """Read whole artefact kinds at once, stacked per example in token order.
+
+        :meth:`vector` answers one cell, and answering a training corpus one cell
+        at a time is the wrong shape of question: each call opens a connection and
+        scans the shard glob, so a Group reading two kinds over 21k answer tokens
+        issues 42k full scans over 1,100 files before its first optimiser step. One
+        query returns the same data.
+
+        The rows come back ordered by answer-token index, so the leading axis of
+        every returned array is the answer-token ordinal — the same key the
+        Student's loss is scored at, with no alignment logic (story 24).
+
+        Args:
+            kinds: The artefact kinds to read.
+            example_ids: The examples to read, or ``None`` for all of them.
+                Filtering here rather than afterwards keeps the decode off rows
+                that were never wanted.
+
+        Returns:
+            ``{example_id: {kind: array[answer_tokens, ...]}}``, holding only
+            examples the store actually has rows for.
+
+        Raises:
+            MissingArtifactKindError: If any kind is not in the store schema.
+        """
+        self.metadata.require_kinds(kinds)
+        wanted = list(kinds)
+        if not wanted:
+            return {}
+
+        columns = ", ".join([EXAMPLE_ID, ANSWER_TOKEN_INDEX, *wanted])
+        sql = f"SELECT {columns} FROM artifacts"
+        params: list[Any] = []
+        if example_ids is not None:
+            selected = list(example_ids)
+            if not selected:
+                return {}
+            placeholders = ", ".join("?" for _ in selected)
+            sql += f" WHERE {EXAMPLE_ID} IN ({placeholders})"
+            params = list(selected)
+        sql += f" ORDER BY {EXAMPLE_ID}, {ANSWER_TOKEN_INDEX}"
+
+        stacked: dict[str, dict[str, list[np.ndarray]]] = {}
+        for row in self._read(sql, params):
+            per_kind = stacked.setdefault(row[0], {kind: [] for kind in wanted})
+            for offset, kind in enumerate(wanted, start=2):
+                per_kind[kind].append(self.metadata.vector_kinds[kind].decode(row[offset]))
+        return {
+            example_id: {kind: np.stack(values) for kind, values in per_kind.items()}
+            for example_id, per_kind in stacked.items()
+        }
 
     def vector(self, example_id: str, answer_token_index: int, kind: str) -> np.ndarray:
         """Return one decoded vector artefact.

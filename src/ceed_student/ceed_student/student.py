@@ -156,29 +156,41 @@ class CeedStudent(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def answer_logits(self, batch: Any, view: Any) -> torch.Tensor:
-        """Return the Student's logits at the batch's answer-token positions.
+    def answer_forward(self, batch: Any, view: Any, hidden_layers: Any = frozenset()) -> Any:
+        """Return what the objective reads at the batch's answer-token positions.
+
+        Hidden states are computed only when a signal asked for them, so a
+        backbone-only Group pays nothing for the machinery B3 and B5 need. The
+        layer indices are the Student's own: ``hidden_states[0]`` from a Hugging
+        Face model is the embedding output, so student layer ``i`` is index
+        ``i + 1``.
 
         Args:
             batch: The training batch, whose ``student_inputs`` are run through
                 the model and whose ``answer_token_positions`` select the
                 positions the answer tokens are predicted at.
             view: The forward view; only the original view is supported.
+            hidden_layers: The student layers whose residual states to return.
 
         Returns:
-            The logits at the answer positions, ``[answer_tokens, vocab]``.
+            A :class:`~ceed_student.training.StudentForward` scoped to the
+            answer tokens.
 
         Raises:
             NotImplementedError: If an intervened view is requested.
         """
         from ceed_student.auxiliary import ForwardView
+        from ceed_student.training import StudentForward
 
         if view is not ForwardView.ORIGINAL:
             raise NotImplementedError(
                 f"the Student has no {view} forward; intervened views arrive with "
                 "the intervention pipeline"
             )
-        outputs = self.model(**batch.student_inputs)
+        wanted = frozenset(hidden_layers)
+        outputs = self.model(**batch.student_inputs, output_hidden_states=bool(wanted))
+        positions = batch.answer_token_positions
         # The batch holds one example, so the leading batch axis is dropped
         # before the answer positions are selected.
-        return outputs.logits[0][batch.answer_token_positions]
+        hidden = {layer: outputs.hidden_states[layer + 1][0][positions] for layer in sorted(wanted)}
+        return StudentForward(logits=outputs.logits[0][positions], hidden_states=hidden)

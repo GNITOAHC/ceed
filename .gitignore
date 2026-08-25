@@ -24,3 +24,4 @@ data/
 # Merged standalone checkpoints (~15 GB each), rebuildable by
 # scripts/merge_adapter.py from a run's adapter.
 merged/
+logs/

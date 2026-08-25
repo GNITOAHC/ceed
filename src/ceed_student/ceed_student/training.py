@@ -26,7 +26,7 @@ against a tiny CPU Student stays cheap and needs no GPU.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -34,12 +34,21 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 from torch import Tensor
 
-from ceed_core import GroupConfig, ParamEfficiencyMode
-from ceed_student.auxiliary import AuxTerm, ForwardView, WarmupSchedule, training_loss
+from ceed_core import GroupConfig, ParamEfficiencyMode, run_hash
+from ceed_student.auxiliary import (
+    AuxiliarySignal,
+    ForwardView,
+    WarmupSchedule,
+    aux_terms,
+    required_forward_views,
+    required_student_layers,
+    training_loss,
+)
 from ceed_student.backbone import backbone_loss
 
 CHECKPOINT_DIRNAME = "checkpoint"
 PROGRESS_FILENAME = "progress.json"
+PROBES_DIRNAME = "probes"
 
 
 @dataclass
@@ -70,18 +79,90 @@ class TrainingBatch:
     artefacts: dict[str, Tensor] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class StudentForward:
+    """What one forward view of one batch yields, scoped to the answer tokens.
+
+    Everything a Group's objective reads comes from here, and it is all sliced to
+    the answer tokens before it leaves the Student, because every cached teacher
+    artefact is (ADR-0001) — so a signal never has to know where the answer sat
+    in the sequence.
+
+    Attributes:
+        logits: The Student's next-token logits at the answer positions,
+            ``[answer_tokens, vocab]``.
+        hidden_states: The residual-stream state at each *requested* student
+            layer, ``[answer_tokens, hidden]``. Only the layers the Group's
+            signals asked for are present; a backbone-only Group gets none, and
+            the Student need not compute them.
+    """
+
+    logits: Tensor
+    hidden_states: Mapping[int, Tensor] = field(default_factory=dict)
+
+
 @runtime_checkable
 class TrainableStudent(Protocol):
     """A Student the loop can train: a torch module that answers per forward view.
 
     The concrete Student is a ``torch.nn.Module`` (so it has parameters the
     optimiser and ``accelerate`` handle); this protocol adds the one method the
-    loop calls — producing the answer-token logits under a given forward view.
+    loop calls — running the Student under a forward view and returning what the
+    objective reads at the answer tokens.
     """
 
-    def answer_logits(self, batch: TrainingBatch, view: ForwardView) -> Tensor:
-        """Return the Student's answer-token logits for ``batch`` under ``view``."""
+    def answer_forward(
+        self, batch: TrainingBatch, view: ForwardView, hidden_layers: frozenset[int]
+    ) -> StudentForward:
+        """Run ``batch`` under ``view``, returning answer-token logits and hiddens.
+
+        Args:
+            batch: The step's batch.
+            view: The forward view to run under.
+            hidden_layers: The student layers whose hidden states the Group's
+                signals need; empty for a backbone-only Group.
+        """
         ...
+
+
+@dataclass(frozen=True)
+class SignalContext:
+    """Everything an auxiliary signal is given for one step.
+
+    Attributes:
+        batch: The step's batch, carrying the teacher's cached artefacts.
+        forwards: The Student's forward per view. A signal reads only views it
+            declared, so the trainer never runs a forward no Group asked for.
+    """
+
+    batch: TrainingBatch
+    forwards: Mapping[ForwardView, StudentForward]
+
+    @property
+    def original(self) -> StudentForward:
+        """The original (un-intervened) forward, which every Group runs."""
+        return self.forwards[ForwardView.ORIGINAL]
+
+    def artefact(self, kind: str) -> Tensor:
+        """Return a cached teacher artefact for this batch's answer tokens.
+
+        Args:
+            kind: The artefact kind, as declared by the signal's
+                ``required_kinds``.
+
+        Returns:
+            The artefact, ``[answer_tokens, ...]``.
+
+        Raises:
+            KeyError: If the batch does not carry it — which means the
+                dataloader was not asked for a kind some signal requires, and is
+                a wiring bug rather than a data problem.
+        """
+        if kind not in self.batch.artefacts:
+            raise KeyError(
+                f"this batch carries no {kind!r} artefact; it holds {sorted(self.batch.artefacts)}"
+            )
+        return self.batch.artefacts[kind]
 
 
 @dataclass(frozen=True)
@@ -97,6 +178,11 @@ class TrainingOutcome:
         steps: The step budget targeted (the config's ``steps``).
         steps_run: How many steps this invocation actually ran — zero when a
             completed checkpoint was reused.
+        batch_size: The examples per optimiser step, accumulated.
+        examples_seen: How many examples the whole run consumed
+            (``steps * batch_size``), recorded so the epoch count is read off the
+            record rather than recomputed from the config.
+        epochs: How many passes over the training corpus that came to.
         resumed: Whether the run continued from an existing checkpoint.
         initial_loss: The backbone loss at this invocation's first step (or the
             restored final loss if nothing ran).
@@ -104,13 +190,25 @@ class TrainingOutcome:
         backbone_metrics: The final cross-entropy and distillation components.
         checkpoint_dir: Where the (frozen, reusable) checkpoint was written.
         total_parameters: The Student's total parameter count.
-        trainable_parameters: How many parameters the optimiser updated.
+        trainable_parameters: How many parameters the optimiser updated,
+            excluding probes — a probe is thrown away, so counting it here would
+            overstate what was trained into the deployed Student.
+        signal_names: The auxiliary signals that actually trained, in order. The
+            single independent variable of the whole comparison, so it is
+            recorded rather than inferred from the Group code.
+        probe_parameters: How many probe parameters were optimised and then
+            discarded; zero for a Group with no probing signal.
+        auxiliary_metrics: Each signal's final scalar contribution, keyed by
+            signal name.
     """
 
     param_efficiency: ParamEfficiencyMode
     lora_rank: int | None
     steps: int
     steps_run: int
+    batch_size: int
+    examples_seen: int
+    epochs: float
     resumed: bool
     initial_loss: float
     final_loss: float
@@ -118,6 +216,9 @@ class TrainingOutcome:
     checkpoint_dir: str
     total_parameters: int
     trainable_parameters: int
+    signal_names: tuple[str, ...] = ()
+    probe_parameters: int = 0
+    auxiliary_metrics: dict[str, float] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -148,6 +249,79 @@ def _move_batch(batch: TrainingBatch, device: Any) -> TrainingBatch:
         else batch.coupling_strength.to(device),
         artefacts={k: v.to(device) for k, v in batch.artefacts.items()},
     )
+
+
+def resume_key(config: GroupConfig) -> str:
+    """Return the identity a checkpoint may be resumed under.
+
+    This is the run hash with the *step budget* normalised away, and it is what
+    names and guards a checkpoint directory. Everything else about a Group — its
+    objective, its signals, its batch size, its layer mapping, its seed — changes
+    what training does, so a checkpoint written under a different value of any of
+    them describes a different run and must not be adopted.
+
+    The step budget is excluded because raising it is the one change that is
+    genuinely a continuation: the example order is a pure function of the global
+    position, so running 3 steps and then 5 reaches exactly the state that running
+    5 from the start would.
+
+    Args:
+        config: The resolved Group.
+
+    Returns:
+        The hex hash identifying resumable-compatible configurations.
+    """
+    if config.training is None:
+        return run_hash(config)
+    normalised = config.model_copy(
+        update={"training": config.training.model_copy(update={"steps": 1})}
+    )
+    return run_hash(normalised)
+
+
+class ExampleSchedule:
+    """Which example each micro-step of a run sees, deterministically.
+
+    Two properties matter and neither is free.
+
+    **The corpus is shuffled, once per epoch.** Walking the corpus in a fixed
+    cyclic order means every epoch presents the same examples in the same order,
+    so the gradient noise of epoch two is correlated with that of epoch one and
+    the optimiser sees far less of the variety it is being paid for. A per-epoch
+    permutation removes that.
+
+    **The order is a pure function of the seed and the global position.** A run
+    that is preempted at micro-step 40,000 and resumed must continue the same
+    walk, not restart it — so nothing here is stateful, and asking for position
+    *p* twice gives the same example twice. That also makes two Groups at the
+    same seed see the corpus in the *same* order, which is what keeps their
+    difference the auxiliary signal rather than the shuffle.
+    """
+
+    def __init__(self, n_examples: int, seed: int) -> None:
+        """Schedule a corpus of ``n_examples`` under ``seed``.
+
+        Raises:
+            ValueError: If there are no examples to schedule.
+        """
+        if n_examples <= 0:
+            raise ValueError("cannot schedule training over an empty corpus")
+        self.n_examples = n_examples
+        self.seed = seed
+        self._epoch = -1
+        self._order: Tensor = torch.empty(0, dtype=torch.long)
+
+    def _order_for(self, epoch: int) -> Tensor:
+        if epoch != self._epoch:
+            generator = torch.Generator().manual_seed(self.seed * 1_000_003 + epoch)
+            self._order = torch.randperm(self.n_examples, generator=generator)
+            self._epoch = epoch
+        return self._order
+
+    def index_at(self, position: int) -> int:
+        """Return the example index the run's ``position``-th micro-step sees."""
+        epoch, offset = divmod(position, self.n_examples)
+        return int(self._order_for(epoch)[offset])
 
 
 def resolve_lora_targets(model: torch.nn.Module, leaf_names: Sequence[str]) -> list[str]:
@@ -223,6 +397,7 @@ class AccelerateTrainer:
         build_student: Callable[[GroupConfig], TrainableStudent],
         build_batches: Callable[[GroupConfig], Sequence[TrainingBatch]],
         output_root: Path,
+        build_signals: Callable[[GroupConfig], Sequence[AuxiliarySignal]] | None = None,
         lora_targets: Sequence[str] = ("q_proj", "k_proj", "v_proj", "o_proj"),
         lora_rank: int = 4,
         lora_alpha: int = 8,
@@ -233,7 +408,9 @@ class AccelerateTrainer:
         The parameter-efficiency mode is *not* a trainer setting: it is read from
         ``config.param_efficiency`` at :meth:`train` time, so the single
         configuration flag selects it and the trainer cannot silently disagree
-        with the Group it is running (ADR-0005).
+        with the Group it is running (ADR-0005). The same is true of the
+        auxiliary signals: the factory is handed the Group and returns what that
+        Group declares, so the loop has no per-Group branch.
 
         Args:
             build_student: Builds the Student for a Group. Injected so the real
@@ -241,6 +418,8 @@ class AccelerateTrainer:
             build_batches: Builds the Group's training batches (Student inputs
                 plus the teacher's cached targets read from the store).
             output_root: The directory the checkpoint is written under.
+            build_signals: Builds the Group's auxiliary signals. Omitted for the
+                backbone-only Groups, which declare none.
             lora_targets: The module names LoRA adapts when in LoRA mode.
             lora_rank: The LoRA adapter rank; recorded so a null result can be
                 read against the adapter capacity that produced it (ADR-0005).
@@ -249,6 +428,7 @@ class AccelerateTrainer:
         """
         self.build_student = build_student
         self.build_batches = build_batches
+        self.build_signals = build_signals
         self.output_root = output_root
         self.lora_targets = lora_targets
         self.lora_rank = lora_rank
@@ -264,12 +444,54 @@ class AccelerateTrainer:
             return None
         return json.loads(path.read_text())
 
-    def _write_progress(self, completed: int, metrics: dict[str, float], params: dict[str, int]):
+    def _write_progress(
+        self,
+        completed: int,
+        metrics: dict[str, float],
+        params: dict[str, int],
+        config: GroupConfig,
+    ) -> None:
+        """Record how far this run got, and which configuration it was."""
         checkpoint = self._checkpoint_dir()
         checkpoint.mkdir(parents=True, exist_ok=True)
         (checkpoint / PROGRESS_FILENAME).write_text(
-            json.dumps({"completed_steps": completed, **metrics, **params})
+            json.dumps(
+                {
+                    "completed_steps": completed,
+                    "config_hash": run_hash(config),
+                    "resume_key": resume_key(config),
+                    **metrics,
+                    **params,
+                }
+            )
         )
+
+    @staticmethod
+    def _check_resumable(prior: dict[str, Any], key: str, group_code: str) -> None:
+        """Refuse to resume a checkpoint some *other* configuration wrote.
+
+        Freezing and reusing a baseline's checkpoint is what stops it being
+        retrained for every later comparison, and it is exactly why a checkpoint
+        must be matched by configuration rather than by Group code. A Group whose
+        batch size, layer mapping, or objective changed is a different run; if it
+        adopted the old checkpoint it would report the previous configuration's
+        training under the new configuration's name — and, if that checkpoint were
+        already complete, would train nothing at all while appearing to succeed.
+
+        The step budget is the one field deliberately excluded (see
+        :func:`resume_key`), so raising a budget continues the same run.
+
+        Raises:
+            ValueError: If a different configuration wrote this checkpoint.
+        """
+        written_by = prior.get("resume_key")
+        if written_by is not None and written_by != key:
+            raise ValueError(
+                f"the checkpoint here was written by configuration {written_by[:12]}, "
+                f"but Group {group_code} is {key[:12]}. Resuming it would report the "
+                "older configuration's training under this one's name. Point --output "
+                "somewhere else, or delete the checkpoint to retrain."
+            )
 
     def _save_adapter(
         self, accelerator: Any, model: Any, mode: ParamEfficiencyMode
@@ -288,6 +510,21 @@ class AccelerateTrainer:
         if save is None:
             return
         save(str(self._checkpoint_dir() / "adapter"))
+
+    def _save_probes(self, probes: torch.nn.Module) -> None:
+        """Write the probes beside the checkpoint, kept out of the deployed Student.
+
+        A probe is deletable by construction: it is a parameter of the auxiliary
+        signal, never of the Student, so nothing has to be stripped from the
+        Student to remove it. Saving them separately keeps them available for
+        analysis while making it structurally impossible for one to reach the
+        adapter a served model is loaded with.
+        """
+        if not list(probes.parameters()):
+            return
+        directory = self._checkpoint_dir() / PROBES_DIRNAME
+        directory.mkdir(parents=True, exist_ok=True)
+        torch.save(probes.state_dict(), directory / "probes.pt")
 
     def train(self, config: GroupConfig) -> TrainingOutcome:
         """Train the Group's Student on the backbone, resuming if a checkpoint exists.
@@ -326,23 +563,37 @@ class AccelerateTrainer:
         )
         trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+        signals = list(self.build_signals(config)) if self.build_signals is not None else []
+        # Probes are optimised with the Student and thrown away with the signal,
+        # so they are held apart from it: the Student's own module tree is never
+        # touched and the deployed model is architecturally identical (story 47).
+        probes = torch.nn.ModuleList([s for s in signals if isinstance(s, torch.nn.Module)])
+        probe_parameters = sum(p.numel() for p in probes.parameters() if p.requires_grad)
+
         optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad], lr=training.learning_rate
+            [p for p in model.parameters() if p.requires_grad]
+            + [p for p in probes.parameters() if p.requires_grad],
+            lr=training.learning_rate,
         )
-        model, optimizer = accelerator.prepare(model, optimizer)
+        model, probes, optimizer = accelerator.prepare(model, probes, optimizer)
 
         batches = self.build_batches(config)
+        order = ExampleSchedule(len(batches), config.seed)
         schedule = WarmupSchedule(training.warmup.backbone_only_steps, training.warmup.ramp_steps)
+        hidden_layers = required_student_layers(signals)
+        views = sorted(required_forward_views(signals))
         params = {
             "total_parameters": total_parameters,
             "trainable_parameters": trainable_parameters,
         }
 
+        key = resume_key(config)
         prior = self._read_progress()
         completed = 0
         resumed = False
         restored = {"loss": 0.0, "cross_entropy": 0.0, "kd": 0.0}
         if prior is not None:
+            self._check_resumable(prior, key, config.group_code)
             accelerator.load_state(str(self._checkpoint_dir()))
             completed = int(prior["completed_steps"])
             resumed = completed > 0
@@ -350,48 +601,81 @@ class AccelerateTrainer:
 
         initial_loss = restored["loss"]
         last = dict(restored)
-        no_aux: list[AuxTerm] = []
+        auxiliary: dict[str, float] = {}
 
         model.train()
+        probes.train()
         for step in range(completed, training.steps):
-            batch = _move_batch(batches[step % len(batches)], accelerator.device)
-            logits = model.answer_logits(batch, ForwardView.ORIGINAL)
-            backbone = backbone_loss(
-                logits,
-                batch.gold_token_ids,
-                batch.teacher_topk_ids,
-                batch.teacher_topk_values,
-                kd_weight=training.backbone.kd_weight,
-                temperature=training.backbone.kd_temperature,
-            )
-            loss = training_loss(backbone, no_aux, step=step, schedule=schedule)
-
+            # One optimiser step over `batch_size` examples. The Student is 8B and
+            # a document image is thousands of visual tokens, so the batch is
+            # accumulated rather than stacked: identical gradients, one example's
+            # worth of activation memory.
             optimizer.zero_grad()
-            accelerator.backward(loss)
+            totals = {"loss": 0.0, "cross_entropy": 0.0, "kd": 0.0}
+            aux_totals: dict[str, float] = {}
+            for micro in range(training.batch_size):
+                position = step * training.batch_size + micro
+                batch = _move_batch(batches[order.index_at(position)], accelerator.device)
+                forwards = {
+                    view: model.answer_forward(batch, view, hidden_layers) for view in views
+                }
+                context = SignalContext(batch=batch, forwards=forwards)
+                backbone = backbone_loss(
+                    context.original.logits,
+                    batch.gold_token_ids,
+                    batch.teacher_topk_ids,
+                    batch.teacher_topk_values,
+                    kd_weight=training.backbone.kd_weight,
+                    temperature=training.backbone.kd_temperature,
+                )
+                terms = aux_terms(signals, context)
+                loss = training_loss(backbone, terms, step=step, schedule=schedule)
+
+                # Scaled by the accumulation, so the summed gradient is the mean
+                # over the batch and the learning rate means the same thing at any
+                # batch size. Dividing before the backward is safe in fp16: PEFT
+                # keeps the adapter in fp32 over a half-precision base, and the
+                # probes are fp32 by construction, so the accumulation the
+                # gradients land in is full precision either way.
+                accelerator.backward(loss / training.batch_size)
+
+                totals["loss"] += float(loss.detach()) / training.batch_size
+                totals["cross_entropy"] += (
+                    float(backbone.cross_entropy.detach()) / training.batch_size
+                )
+                totals["kd"] += float(backbone.kd.detach()) / training.batch_size
+                for term in terms:
+                    aux_totals[term.name] = (
+                        aux_totals.get(term.name, 0.0)
+                        + float(term.value.detach()) / training.batch_size
+                    )
+
             optimizer.step()
 
-            last = {
-                "loss": float(loss.detach()),
-                "cross_entropy": float(backbone.cross_entropy.detach()),
-                "kd": float(backbone.kd.detach()),
-            }
+            last = totals
+            auxiliary = aux_totals
             if step == completed:
                 initial_loss = last["loss"]
             if training.checkpoint_every and (step + 1) % training.checkpoint_every == 0:
                 accelerator.save_state(str(self._checkpoint_dir()))
-                self._write_progress(step + 1, last, params)
+                self._write_progress(step + 1, last, params, config)
 
-        steps_run = training.steps - completed
+        # A checkpoint past the requested budget already satisfies it.
+        steps_run = max(0, training.steps - completed)
         if steps_run > 0:
             accelerator.save_state(str(self._checkpoint_dir()))
-            self._write_progress(training.steps, last, params)
+            self._write_progress(training.steps, last, params, config)
             self._save_adapter(accelerator, model, mode)
+            self._save_probes(accelerator.unwrap_model(probes))
 
         return TrainingOutcome(
             param_efficiency=mode,
             lora_rank=self.lora_rank if mode is ParamEfficiencyMode.LORA else None,
             steps=training.steps,
             steps_run=steps_run,
+            batch_size=training.batch_size,
+            examples_seen=training.steps * training.batch_size,
+            epochs=training.steps * training.batch_size / len(batches),
             resumed=resumed,
             initial_loss=initial_loss,
             final_loss=last["loss"],
@@ -399,4 +683,7 @@ class AccelerateTrainer:
             checkpoint_dir=str(self._checkpoint_dir()),
             total_parameters=total_parameters,
             trainable_parameters=trainable_parameters,
+            signal_names=tuple(signal.name for signal in signals),
+            probe_parameters=probe_parameters,
+            auxiliary_metrics=auxiliary,
         )

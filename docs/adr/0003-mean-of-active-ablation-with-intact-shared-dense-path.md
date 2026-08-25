@@ -21,3 +21,16 @@ For the combine-weight definition, raw router logits and bare softmax weights we
 - CEA magnitudes are attenuated by construction: removing one of eight experts leaves the dense path rebuilding the residual stream for free. If the dense path dominates the layer's FFN output norm, every measured ΔlogP is small and the routing–attribution correlation is computed over near-noise.
 - This is therefore the single largest threat to the thesis, and it is cheap to measure. **Phase 0.0** is added ahead of everything else in Phase 0: sweep all 30 layers on ~200 examples and report the dense-versus-sparse share of FFN output norm alongside attribution magnitude and diversity per layer. The three CEA layers are then chosen from that sweep rather than asserted, which also answers "why these three layers?" for a rounding error of compute.
 - Changing any part of this definition changes the extraction fingerprint and invalidates every cached CEA artefact and every golden file.
+
+## Measured note: how much `per_expert_scale` actually reorders (2026-08-02)
+
+The choice of combine-weight definition rests on `per_expert_scale` not being a monotone rescale. It is not — but in this checkpoint the effect is smaller than the amendment's wording suggests, and that is worth knowing before Phase 0.1's headline number is read.
+
+`per_expert_scale` spans **0.9805 to 1.0234** across all 30 layers (mean ≈ 1.000, sd ≈ 0.011), so it can only reorder experts whose normalised routing weights are within about 4% of each other. Measured over 300 (answer token, layer) pairs from three DocVQA examples:
+
+- the ordering of the top-8 differs from the router-probability ordering in **26%** of pairs;
+- the **top-1** expert differs in **1.3%**.
+
+So the three candidate definitions are genuinely not monotone transforms of one another and the amendment stands, but the divergence lives in the tail of the top-8 rather than in which expert dominates. Two consequences: Phase 0.1's Spearman correlation should move very little between the three definitions, so a large difference between them would indicate a bug rather than a finding; and "the router says something different from what ablation measures" cannot be attributed to the per-expert scale — if divergence appears, it is divergence from routing itself.
+
+This is a three-example measurement taken during ticket 08's extraction smoke test, reported to size the effect, not to settle it. Phase 0.0's sweep covers it properly.

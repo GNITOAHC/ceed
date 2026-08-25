@@ -49,6 +49,36 @@ class BackboneLoss:
     kd: Tensor
 
 
+def topk_kd_per_token(
+    student_logits: Float[Tensor, "tokens vocab"],
+    teacher_topk_ids: Int[Tensor, "tokens k"],
+    teacher_topk_values: Float[Tensor, "tokens k"],
+    temperature: float = 1.0,
+) -> Float[Tensor, " tokens"]:
+    """Return the distillation divergence for each answer token, unreduced.
+
+    This is the backbone's KD term before it is averaged: ``KL(teacher ||
+    student)`` per token over the teacher's cached top-k support, scaled by
+    ``temperature**2``. It is exposed separately because B4 reweights the
+    *same* divergence per token rather than defining a new one — sharing this
+    function is what makes B4's only difference from B2 the weighting.
+
+    Args:
+        student_logits: The Student's next-token logits at each answer position.
+        teacher_topk_ids: The token ids of the teacher's cached top-k logits.
+        teacher_topk_values: The teacher's logit values at those ids.
+        temperature: The distillation softmax temperature.
+
+    Returns:
+        One divergence per answer token.
+    """
+    student_on_support = torch.gather(student_logits, -1, teacher_topk_ids)
+    teacher_p = functional.softmax(teacher_topk_values / temperature, dim=-1)
+    student_log_q = functional.log_softmax(student_on_support / temperature, dim=-1)
+    per_token = functional.kl_div(student_log_q, teacher_p, reduction="none").sum(dim=-1)
+    return per_token * (temperature**2)
+
+
 def backbone_loss(
     student_logits: Float[Tensor, "tokens vocab"],
     gold_token_ids: Int[Tensor, " tokens"],
@@ -78,15 +108,9 @@ def backbone_loss(
         The total loss and its cross-entropy and distillation components.
     """
     cross_entropy = functional.cross_entropy(student_logits, gold_token_ids)
-
-    # Restrict both distributions to the teacher's cached top-k support: the
-    # Student's logits are gathered at exactly the ids the teacher recorded.
-    student_on_support = torch.gather(student_logits, -1, teacher_topk_ids)
-    teacher_p = functional.softmax(teacher_topk_values / temperature, dim=-1)
-    student_log_q = functional.log_softmax(student_on_support / temperature, dim=-1)
-    # KL(teacher || student) per token, averaged, with the standard T**2 scale.
-    kd_per_token = functional.kl_div(student_log_q, teacher_p, reduction="none").sum(dim=-1)
-    kd = kd_per_token.mean() * (temperature**2)
+    kd = topk_kd_per_token(
+        student_logits, teacher_topk_ids, teacher_topk_values, temperature
+    ).mean()
 
     total = cross_entropy + kd_weight * kd
     return BackboneLoss(total=total, cross_entropy=cross_entropy, kd=kd)
